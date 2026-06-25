@@ -9,6 +9,7 @@ import { HandlebarsPreview } from '@/features/editor/HandlebarsPreview'
 import { EditorStatusBar } from '@/features/editor/EditorStatusBar'
 import { RunPanel } from '@/features/run/RunPanel'
 import { PermissionDialog } from '@/features/run/PermissionDialog'
+import { InputDialog } from '@/features/run/InputDialog'
 
 const HRESIZE =
   'w-px bg-border transition-colors data-[resize-handle-state=drag]:bg-primary data-[resize-handle-state=hover]:bg-primary/60'
@@ -79,6 +80,7 @@ export default function App() {
       </PanelGroup>
 
       <PermissionDialog />
+      <InputDialog />
     </div>
   )
 }

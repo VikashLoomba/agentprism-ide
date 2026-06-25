@@ -15,6 +15,8 @@ import { parse } from 'acorn'
 import type { Node } from 'acorn'
 import { DETERMINISM_BLOCKLIST } from './dsl.ts'
 import type { WorkflowMeta } from './dsl.ts'
+import { PARAM_TYPES } from './param.ts'
+import type { ParamType } from './param.ts'
 import { ACP_AGENTS } from './agents.ts'
 import type { AcpAgentId } from './agents.ts'
 import { AGENT_PRODUCER_NAMES, DSL_METHOD_MAP, validateMethodConfig } from './dsl-registry.ts'
@@ -91,6 +93,21 @@ class LiteralError extends Error {
 }
 
 const RESERVED_KEYS = new Set(['__proto__', 'constructor', 'prototype'])
+
+/** JS identifier shape for a declared input/param name. */
+const INPUT_NAME_RE = /^[A-Za-z_$][\w$]*$/
+
+/** True when `value` strictly matches the declared param `type` (no coercion). */
+function valueMatchesParamType(value: unknown, type: ParamType): boolean {
+  switch (type) {
+    case 'string': return typeof value === 'string'
+    case 'number': return typeof value === 'number'
+    case 'boolean': return typeof value === 'boolean'
+    case 'string[]': return Array.isArray(value) && value.every((v) => typeof v === 'string')
+    case 'number[]': return Array.isArray(value) && value.every((v) => typeof v === 'number')
+    case 'boolean[]': return Array.isArray(value) && value.every((v) => typeof v === 'boolean')
+  }
+}
 
 /** Statically evaluate an allowed literal AST node (pi's evaluateLiteral). */
 function evaluateLiteral(node: Node): unknown {
@@ -198,6 +215,39 @@ function validateMeta(meta: unknown): string[] {
       for (const p of m.prompts) {
         if (typeof p !== 'string' || p.trim() === '') {
           errors.push('each meta.prompts entry must be a non-empty string')
+          break
+        }
+      }
+    }
+  }
+  if (m.inputs !== undefined) {
+    if (!Array.isArray(m.inputs)) {
+      errors.push('meta.inputs must be an array of input declarations')
+    } else {
+      for (const input of m.inputs) {
+        if (typeof input !== 'object' || input === null || Array.isArray(input)) {
+          errors.push('each meta.inputs entry must be an object { name, type }')
+          break
+        }
+        const e = input as Record<string, unknown>
+        if (typeof e.name !== 'string' || !INPUT_NAME_RE.test(e.name)) {
+          errors.push('each meta.inputs entry must have a name that is a valid identifier')
+          break
+        }
+        if (typeof e.type !== 'string' || !(PARAM_TYPES as readonly string[]).includes(e.type)) {
+          errors.push(`meta.inputs.${e.name}.type must be one of: ${PARAM_TYPES.join(', ')}`)
+          break
+        }
+        if (e.description !== undefined && typeof e.description !== 'string') {
+          errors.push(`meta.inputs.${e.name}.description must be a string`)
+          break
+        }
+        if (e.required !== undefined && typeof e.required !== 'boolean') {
+          errors.push(`meta.inputs.${e.name}.required must be a boolean`)
+          break
+        }
+        if (e.default !== undefined && !valueMatchesParamType(e.default, e.type as ParamType)) {
+          errors.push(`meta.inputs.${e.name}.default does not match type ${e.type}`)
           break
         }
       }

@@ -1,3 +1,4 @@
+import path from 'node:path'
 import { customAlphabet } from 'nanoid'
 import { ACP_AGENTS } from '../../shared/agents.ts'
 import type { AcpAgentId, SessionModeState } from '../../shared/agents.ts'
@@ -21,7 +22,7 @@ import type {
   RunStatus,
   ToolCallState,
 } from '../../shared/events.ts'
-import type { PermissionRequest, PermissionResponse, RunRequest } from '../../shared/protocol.ts'
+import type { InputRequest, InputResponse, PermissionRequest, PermissionResponse, RunRequest } from '../../shared/protocol.ts'
 import type { Capability, CapabilityContext, Json } from '../../shared/capability.ts'
 import type { CapabilityCatalog } from '../../shared/capability-resolve.ts'
 import { AcpAgentConnection, type PermissionAsk } from '../acp/connection.ts'
@@ -52,6 +53,9 @@ type PermissionOutcome = RequestPermissionResponse['outcome']
 export interface RunCallbacks {
   emit: (event: RunEvent) => void
   notifyPermission: (req: PermissionRequest) => void
+  /** Surface a mid-run human-in-the-loop input request to the host. The host
+   *  answers it later via resolveInput(); mirrors notifyPermission. */
+  notifyInput: (req: InputRequest) => void
 }
 
 interface PauseRecord {
@@ -147,6 +151,13 @@ export class WorkflowRun {
   private modeId?: string
   private autoApprove: boolean
   private stepMode: boolean
+  /** Secret source for capabilities (default process.env); never serialized. */
+  private env: NodeJS.ProcessEnv
+  /** When true, checkpoint()/input() interactions park and await resolveInput
+   *  (a UI subscriber or onInput handler is attached). When false (default),
+   *  they resolve synchronously via the headless policy (opts.headless),
+   *  preserving today's auto-return behavior. The controller flips this. */
+  private interactiveInput = false
 
   private connections = new Map<AcpAgentId, AcpAgentConnection>()
   private connecting = new Map<AcpAgentId, Promise<AcpAgentConnection>>()
@@ -181,12 +192,14 @@ export class WorkflowRun {
   private currentPause?: PauseRecord
   private waitingPauses: PauseRecord[] = []
   private pendingPermissions = new Map<string, (outcome: PermissionOutcome) => void>()
+  private pendingInputs = new Map<string, (response: InputResponse) => void>()
   private lastModesJson = ''
 
-  constructor(request: RunRequest, callbacks: RunCallbacks) {
+  constructor(request: RunRequest, callbacks: RunCallbacks, opts: { env?: NodeJS.ProcessEnv } = {}) {
     this.runId = request.runId
     this.request = request
     this.callbacks = callbacks
+    this.env = opts.env ?? process.env
     this.cwd = request.cwd
     this.modeId = request.modeId
     this.autoApprove = !request.manualApprovals
@@ -275,6 +288,13 @@ export class WorkflowRun {
     this.emit({ type: 'breakpoint:set', lines: this.snapshot.breakpoints })
   }
 
+  /** Controller hook: declare whether mid-run input requests (checkpoint/input)
+   *  will be answered by a host (UI subscriber or onInput resolver). When off
+   *  (default), checkpoint() stays headless and resolves via opts.headless. */
+  setInteractiveInput(on: boolean): void {
+    this.interactiveInput = on
+  }
+
   resume(): void {
     this.stepMode = false
     this.releasePause()
@@ -329,6 +349,9 @@ export class WorkflowRun {
     // Resolve any pending permissions as cancelled.
     for (const resolve of this.pendingPermissions.values()) resolve({ outcome: 'cancelled' })
     this.pendingPermissions.clear()
+    // Wake any parked input interactions as cancelled so checkpoints unwind.
+    for (const resolve of this.pendingInputs.values()) resolve({ kind: 'cancelled' })
+    this.pendingInputs.clear()
   }
 
   resolvePermission(requestId: string, response: PermissionResponse): void {
@@ -336,6 +359,15 @@ export class WorkflowRun {
     if (!resolve) return
     this.pendingPermissions.delete(requestId)
     resolve(response.kind === 'cancelled' ? { outcome: 'cancelled' } : { outcome: 'selected', optionId: response.optionId })
+  }
+
+  /** Resolve a parked checkpoint/input interaction. Mirrors resolvePermission;
+   *  driven by the host's UI message or onInput handler via the controller. */
+  resolveInput(requestId: string, response: InputResponse): void {
+    const resolve = this.pendingInputs.get(requestId)
+    if (!resolve) return
+    this.pendingInputs.delete(requestId)
+    resolve(response)
   }
 
   /* ------------------------------ permissions ----------------------------- */
@@ -519,7 +551,7 @@ export class WorkflowRun {
       const isDefaultBackend = agentId === this.request.agent
       const conn = await this.getConnection(agentId)
       const turn = await conn.runPrompt({
-        cwd: this.cwd,
+        cwd: opts.cwd ? path.resolve(this.cwd, opts.cwd) : this.cwd,
         // The run-wide mode selector only governs the DEFAULT backend; a
         // non-default backend's mode comes purely from opts.config.mode.
         modeId: isDefaultBackend ? this.modeId : undefined,
@@ -606,7 +638,7 @@ export class WorkflowRun {
     // Project overrides user at the process.env layer already (a single flat env);
     // we expose ONLY this capability's declared names, never the whole env.
     for (const name of cap.secrets) {
-      const val = process.env[name]
+      const val = this.env[name]
       secrets[name] = typeof val === 'string' && val.length > 0 ? val : undefined
     }
     return {
@@ -706,9 +738,47 @@ export class WorkflowRun {
 
   private checkpointFn = async (promptText: string, opts: CheckpointOptions = {}): Promise<unknown> => {
     if (this.aborted) throw new WorkflowAbortError()
-    const value = opts.default ?? true
-    this.logAcp('info', 'checkpoint', `Checkpoint: ${promptText} → ${asText(value)} (auto)`)
-    return value
+
+    // Headless back-compat: no UI subscriber / onInput handler attached. The
+    // engine resolves synchronously per opts.headless, preserving today's
+    // auto-return behavior (the controller flips interactiveInput on when a
+    // host can answer).
+    if (!this.interactiveInput) {
+      if (opts.headless === 'abort') {
+        this.logAcp('warn', 'checkpoint', `Checkpoint aborted (headless): ${promptText}`)
+        throw new WorkflowAbortError()
+      }
+      const value = opts.default ?? true
+      this.logAcp('info', 'checkpoint', `Checkpoint: ${promptText} → ${asText(value)} (auto)`)
+      return value
+    }
+
+    // Interactive: surface the request and park until resolveInput() answers it.
+    const requestId = shortid()
+    const req: InputRequest = {
+      requestId,
+      kind: opts.kind ?? 'confirm',
+      prompt: promptText,
+    }
+    if (opts.choices?.length) req.options = opts.choices.map((c) => ({ id: c, label: c }))
+    if (opts.default !== undefined) req.default = opts.default as Json
+    this.logAcp('info', 'checkpoint', `Checkpoint: ${promptText} (awaiting input)`)
+    const response = await new Promise<InputResponse>((resolve) => {
+      this.pendingInputs.set(requestId, resolve)
+      this.emit({ type: 'interaction:request', req })
+      this.callbacks.notifyInput(req)
+    })
+    this.emit({ type: 'interaction:resolved', requestId })
+    // A run-level cancel() resolves parked inputs as cancelled — unwind here.
+    if (this.aborted) throw new WorkflowAbortError()
+    if (response.kind === 'cancelled') {
+      if (opts.headless === 'abort') throw new WorkflowAbortError()
+      const value = opts.default ?? true
+      this.logAcp('info', 'checkpoint', `Checkpoint cancelled: ${promptText} → ${asText(value)} (default)`)
+      return value
+    }
+    this.logAcp('info', 'checkpoint', `Checkpoint: ${promptText} → ${asText(response.value)}`)
+    return response.value
   }
 
   private runNested = async (script: string, args: unknown): Promise<unknown> => {
@@ -793,7 +863,7 @@ export class WorkflowRun {
     // capability resolution gracefully rather than crashing the run.
     let loaded: LoadedCapabilities | undefined
     try {
-      loaded = await loadCapabilities(process.env)
+      loaded = await loadCapabilities(this.env)
       this.capabilityCatalog = loaded.catalog
     } catch (err) {
       this.logAcp('warn', 'capabilities', `Failed to load capabilities: ${err instanceof Error ? err.message : String(err)}`)

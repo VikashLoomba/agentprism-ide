@@ -1,5 +1,6 @@
 import type { AcpAgentId, SessionModeState } from './agents.ts'
 import type { WorkflowMeta } from './dsl.ts'
+import type { InputRequest } from './protocol.ts'
 
 export type RunStatus =
   | 'starting'
@@ -210,4 +211,6 @@ export type RunEvent =
   | { type: 'breakpoint:set'; lines: number[] }
   | { type: 'breakpoint:hit'; pause: PauseInfo }
   | { type: 'breakpoint:resumed'; pauseId: string }
+  | { type: 'interaction:request'; req: InputRequest }
+  | { type: 'interaction:resolved'; requestId: string }
   | { type: 'run:finished'; status: RunStatus; result?: unknown; error?: string; stats: RunStats }

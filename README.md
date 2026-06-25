@@ -77,6 +77,8 @@ Environment variables (optional):
 |---|---|---|
 | `PORT` | `8787` | Backend port |
 | `AGENTPRISM_WORKFLOWS_DIR` | `./workflows` | Where workflows are saved |
+| `AGENTPRISM_TOOLS_DIR` | `./tools` | Where capability/helper modules are loaded from |
+| `AGENTPRISM_PROMPTS_DIR` | `./prompts` | Where prompt templates are loaded from |
 | `AGENTPRISM_DEFAULT_CWD` | `process.cwd()` | Default working directory for runs |
 
 ## The workflow DSL
@@ -138,6 +140,80 @@ Key globals (full types power editor intellisense — see `src/lib/workflow-dts.
 - **Codex** — `model` | `mode` | `reasoning_effort` | `fast-mode`, e.g. `{ agent: 'codex', config: { model: 'gpt-5-codex', reasoning_effort: 'low' } }`.
 
 Example workflows live in `workflows/` (`auth_audit.js`, `codebase_review.js`, `dual_backend_review.js`).
+
+### Typed workflow inputs
+
+A workflow may *optionally* declare typed inputs in its `meta` block. When present, AgentPrism renders a generated form (one control per param) in the Run panel that **gates Run** until every required field is filled, and the values are validated before the run starts:
+
+```js
+export const meta = {
+  name: 'mr_review',
+  description: 'Review a GitLab MR against Jira acceptance criteria.',
+  capabilities: ['jira', 'gitlab'],
+  inputs: [
+    { name: 'jiraKey', type: 'string', required: true, description: 'Ticket key, e.g. ACME-42' },
+    { name: 'project', type: 'string', required: true },
+    { name: 'mr', type: 'number', required: true },
+    { name: 'reviewers', type: 'string[]', default: ['alice', 'bob'] }, // optional, with a default
+  ],
+}
+
+const ticket = await jira.getTicket({ key: args.jiraKey }) // `args` is typed from meta.inputs
+```
+
+- Each entry is `{ name, type, description?, default?, required? }`. `name` must be a JS identifier (it becomes a key on `args`); `type` is one of `string | number | boolean | string[] | number[] | boolean[]`; `required` defaults to `false`.
+- When `meta.inputs` is declared, the form **is** `args` — each param becomes a typed key, and `args` gains a precise type in the editor (`args.jiraKey` is `string`, not `any`). The raw JSON args textarea moves behind an "advanced" toggle.
+- Validation is **strict** (no loose coercion): a required value that is missing, or a value whose type doesn't match, blocks the run with an error. The same `validateInputs` gate runs in the IDE *and* in the programmatic API (see below), so a host gets identical errors.
+- **Back-compat:** a workflow with no `meta.inputs` behaves exactly as before — free-form `args`, `args: any`, no gating.
+
+## Embedding / packaging
+
+AgentPrism ships as a single npm package with two entry points: a CLI that boots the IDE, and an importable runtime that runs workflows programmatically.
+
+### Boot the IDE locally
+
+```bash
+npx agentprism-ide          # boots the server + serves the bundled IDE
+npx agentprism-ide --port 9090 --cwd /path/to/project
+```
+
+This serves the editor and backend from the installed package, while resolving your project's `workflows/`, `tools/`, and `prompts/` (and the run working directory) from the **current directory** — so it works from any project. Agent logins and secrets are read from your environment exactly as in dev.
+
+### Run workflows programmatically
+
+Import the runtime to drive workflows from your own program. You get the **full event stream**, the **mid-run interaction round-trips** (permission approvals and human-in-the-loop input), and a `done` promise with the terminal result:
+
+```js
+import { createRuntime } from 'agentprism'
+
+const runtime = createRuntime() // { cwd?, env? } — env defaults to process.env
+
+const handle = runtime.run(
+  { name: 'mr_review' },                       // a saved workflow… or { source: '<inline script>' }
+  { jiraKey: 'ACME-42', project: 'web', mr: 17 }, // input — validated against meta.inputs first
+  {
+    agent: 'claude',
+    // Resolver ergonomics — answer interactions inline as they arise:
+    onPermission: (req) => ({ kind: 'selected', optionId: req.options[0].optionId }),
+    onInput: (req) => (req.kind === 'confirm' ? true : req.default ?? ''),
+  },
+)
+
+// Push event stream (or use `for await (const ev of handle.events())`):
+const off = handle.on((event) => console.log(event.type, event))
+
+const result = await handle.done // { runId, status: 'completed' | 'failed' | 'cancelled', result?, error? }
+off()
+console.log(result.status, result.result)
+```
+
+- `createRuntime(options?)` → `{ run, get, list, catalogs }`. `run(workflow, input?, options?)` returns a `RunHandle` synchronously, so you can subscribe before the engine starts.
+- **Interactions, two ergonomics over one mechanism:** supply `onPermission` / `onInput` resolvers (the engine awaits them directly), **or** omit them and answer out-of-band via `handle.respond(requestId, response)` after the request arrives as an event. A production host typically implements only the semantic interactions (permission, input); the debug controls (`handle.resume()` / `step()` / `setBreakpoints()`) are the IDE's surface.
+- **Input validation up front:** `run()` validates `input` against the workflow's `meta.inputs` **before** starting. On failure the handle settles `failed` with the error list and emits a failed `run:finished` — same surface as any other failure.
+- A `runWorkflow(workflow, input?, options?)` convenience runs to completion and resolves the terminal `RunResult` in one call.
+- **Secrets come from env only.** Capability secrets are read from `RuntimeOptions.env` (default `process.env`); they are never entered in the UI, never sent to the browser, and never persisted. Set them in your environment before running.
+
+A minimal, runnable host demo lives in [`examples/embed/`](examples/embed/).
 
 ## Authoring with an AI agent
 

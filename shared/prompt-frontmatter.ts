@@ -1,14 +1,19 @@
 // shared/prompt-frontmatter.ts  (isomorphic — NO node:* imports)
 import { z } from 'zod'
 import type { Json } from './capability.ts'
+import { PARAM_TYPES, placeholderFor, paramsToTsType } from './param.ts'
+import type { ParamType } from './param.ts'
 
-/** Closed set of declarable param types. Flat by design so paramsToTsType is total
- *  and dts emission can never produce an open/un-typed member. */
-export const PROMPT_PARAM_TYPES = [
-  'string', 'number', 'boolean',
-  'string[]', 'number[]', 'boolean[]',
-] as const
-export type PromptParamType = (typeof PROMPT_PARAM_TYPES)[number]
+/** Closed set of declarable param types. Re-exported from the neutral
+ *  `shared/param.ts` (back-compat alias of PARAM_TYPES). Flat by design so
+ *  paramsToTsType is total and dts emission can never produce an open member. */
+export const PROMPT_PARAM_TYPES = PARAM_TYPES
+export type PromptParamType = ParamType
+
+// paramsToTsType is the neutral helper (PromptParam satisfies its TsParam shape;
+// PromptParam never sets `optional`, so members stay required — byte-for-byte
+// the prior behavior). Re-exported here so existing importers keep working.
+export { paramsToTsType }
 
 /** One declared parameter (name + type, optional default/example/description). */
 export interface PromptParam {
@@ -84,31 +89,4 @@ export function seedSampleData(params: PromptParam[]): Record<string, Json> {
     out[p.name] = placeholderFor(p.type, p.name)
   }
   return out
-}
-
-function placeholderFor(type: PromptParamType, name: string): Json {
-  switch (type) {
-    case 'string': return `<${name}>`
-    case 'number': return 0
-    case 'boolean': return false
-    case 'string[]': return [`<${name}[0]>`]
-    case 'number[]': return [0]
-    case 'boolean[]': return [false]
-  }
-}
-
-/** Map the declared params to a TS object-type literal string for the dts member.
- *  Total over PROMPT_PARAM_TYPES; empty params => `{}` (still valid). */
-export function paramsToTsType(params: PromptParam[]): string {
-  if (params.length === 0) return '{}'
-  const lines = params.map((p) => {
-    const doc = p.description ? `    /** ${p.description.replace(/\*\//g, '* /')} */\n` : ''
-    return `${doc}    ${p.name}: ${TS_TYPE[p.type]};`
-  })
-  return `{\n${lines.join('\n')}\n  }`
-}
-
-const TS_TYPE: Record<PromptParamType, string> = {
-  string: 'string', number: 'number', boolean: 'boolean',
-  'string[]': 'string[]', 'number[]': 'number[]', 'boolean[]': 'boolean[]',
 }

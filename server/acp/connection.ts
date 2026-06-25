@@ -25,7 +25,7 @@ import type {
   StopReason,
 } from '@agentclientprotocol/sdk'
 import type { AcpAgentSpec } from '../../shared/agents.ts'
-import { AGENT_BINS } from '../config.ts'
+import { resolveAgentBin } from '../config.ts'
 
 export type LogFn = (level: string, type: string, text: string, data?: unknown) => void
 
@@ -108,9 +108,8 @@ export class AcpAgentConnection {
 
   /** Resolve the local binary if installed, else fall back to npx. */
   private resolveCommand(): { command: string; args: string[] } {
-    const bin = AGENT_BINS[this.spec.id]
-    if (bin) {
-      const localBin = path.join(process.cwd(), 'node_modules', '.bin', bin)
+    const localBin = resolveAgentBin(this.spec.id)
+    if (localBin) {
       return { command: localBin, args: [] }
     }
     return { command: this.spec.command, args: this.spec.args }

@@ -9,8 +9,28 @@
  */
 
 import type { AcpAgentId } from './agents.ts'
+import type { ParamType } from './param.ts'
+import type { Json } from './capability.ts'
 
 export type IsolationMode = 'worktree'
+
+/**
+ * One declared workflow input parameter. When a workflow declares
+ * `meta.inputs`, the run's `args` global is built/validated from these (strict
+ * types; see shared/validate-inputs.ts). `name` is the JS identifier the value
+ * is keyed under on `args`. Structurally satisfies `param.ts`'s `TsParam` for
+ * dts emission (required → `name:`, else `name?:`).
+ */
+export interface WorkflowInputParam {
+  /** JS identifier → key on the `args` global. */
+  name: string
+  type: ParamType
+  description?: string
+  /** Seed value when the input is omitted. Must match `type`. */
+  default?: Json
+  /** Required inputs gate Run (default false). */
+  required?: boolean
+}
 
 /**
  * Per-call ACP session config — keys are SessionConfigOption ids advertised by
@@ -63,6 +83,13 @@ export interface WorkflowMeta {
    * validation error.
    */
   prompts?: string[]
+  /**
+   * Optionally declared typed inputs. When present, the run's `args` global is
+   * built and validated from these (strict types, see shared/validate-inputs.ts)
+   * and the IDE renders a generated form that gates Run. Absent ⇒ today's
+   * free-form `args` behavior (back-compat).
+   */
+  inputs?: WorkflowInputParam[]
 }
 
 export interface AgentOptions {
@@ -70,6 +97,12 @@ export interface AgentOptions {
   label?: string
   /** Override the current phase for this single agent. */
   phase?: string
+  /**
+   * Working directory for THIS agent call. Relative paths resolve against the
+   * run cwd; absolute paths are used as-is. Defaults to the run cwd
+   * (RunRequest.cwd) when omitted.
+   */
+  cwd?: string
   /** JSON Schema — agent() resolves to a validated object instead of text. */
   schema?: Record<string, unknown>
   /**

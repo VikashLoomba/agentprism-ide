@@ -12,6 +12,8 @@ import {
 } from 'lucide-react'
 import type { AcpAgentId } from '@shared/agents'
 import type { CapabilityCatalogEntry } from '@shared/protocol'
+import type { WorkflowInputParam } from '@shared/dsl'
+import type { ParamType } from '@shared/param'
 import { useStore } from '@/store/useStore'
 import {
   Select,
@@ -147,19 +149,139 @@ function CapabilitiesPanel() {
   )
 }
 
+/** Render a stored array value as one-value-per-line text for the Textarea. */
+function arrayToLines(value: unknown): string {
+  return Array.isArray(value) ? value.map((v) => String(v)).join('\n') : ''
+}
+
+/** Parse one-value-per-line text back into the strictly-typed array the store
+ *  holds (so validateInputs gates on real types). Blank lines are dropped. */
+function linesToArray(text: string, type: ParamType): unknown[] {
+  const lines = text
+    .split('\n')
+    .map((l) => l.trim())
+    .filter((l) => l.length > 0)
+  if (type === 'number[]') return lines.map((l) => Number(l))
+  if (type === 'boolean[]') return lines.map((l) => l === 'true')
+  return lines
+}
+
+/** One control for a declared `meta.inputs` param, bound to `inputValues`. */
+function InputField({ param }: { param: WorkflowInputParam }) {
+  const value = useStore((s) => s.inputValues[param.name])
+  const setInputValue = useStore((s) => s.setInputValue)
+  const isArray = param.type.endsWith('[]')
+
+  return (
+    <div className="space-y-1">
+      <Label className="flex items-center gap-1 text-[11px] text-muted-foreground">
+        <span className="font-mono text-foreground/90">{param.name}</span>
+        {param.required && <span className="text-warning">*</span>}
+        <span className="text-[10px] text-muted-foreground/60">{param.type}</span>
+      </Label>
+      {param.description && (
+        <p className="text-[10px] leading-snug text-muted-foreground/70">{param.description}</p>
+      )}
+      {param.type === 'boolean' ? (
+        <Switch
+          checked={value === true}
+          onCheckedChange={(b) => setInputValue(param.name, b)}
+        />
+      ) : param.type === 'number' ? (
+        <Input
+          type="number"
+          value={typeof value === 'number' ? String(value) : ''}
+          onChange={(e) =>
+            setInputValue(param.name, e.target.value === '' ? undefined : Number(e.target.value))
+          }
+          className="h-8 font-mono text-[12px]"
+        />
+      ) : isArray ? (
+        <Textarea
+          value={arrayToLines(value)}
+          onChange={(e) => setInputValue(param.name, linesToArray(e.target.value, param.type))}
+          placeholder="one value per line"
+          className="min-h-[44px] resize-none font-mono text-[12px]"
+          spellCheck={false}
+        />
+      ) : (
+        <Input
+          value={typeof value === 'string' ? value : ''}
+          onChange={(e) => setInputValue(param.name, e.target.value)}
+          className="h-8 font-mono text-[12px]"
+        />
+      )}
+    </div>
+  )
+}
+
+/**
+ * When the workflow declares `meta.inputs`, render a generated typed form (the
+ * form IS `args`) and tuck the raw JSON textarea behind an "advanced" toggle.
+ * When it declares none, render today's raw args textarea exactly.
+ */
+function InputsSection() {
+  const inputs = useStore((s) => s.validation.meta?.inputs)
+  const argsText = useStore((s) => s.argsText)
+  const setArgsText = useStore((s) => s.setArgsText)
+  const [advanced, setAdvanced] = useState(false)
+
+  if (!inputs || inputs.length === 0) {
+    return (
+      <div className="space-y-1">
+        <Label className="text-[11px] text-muted-foreground">
+          args <span className="text-muted-foreground/60">(JSON, exposed to the script)</span>
+        </Label>
+        <Textarea
+          value={argsText}
+          onChange={(e) => setArgsText(e.target.value)}
+          placeholder='{ "target": "src/" }'
+          className="min-h-[44px] resize-none font-mono text-[12px]"
+          spellCheck={false}
+        />
+      </div>
+    )
+  }
+
+  return (
+    <div className="space-y-2.5">
+      <Label className="text-[11px] text-muted-foreground">
+        Inputs <span className="text-muted-foreground/60">(typed args for this workflow)</span>
+      </Label>
+      {inputs.map((param) => (
+        <InputField key={param.name} param={param} />
+      ))}
+      <button
+        onClick={() => setAdvanced((a) => !a)}
+        className="flex items-center gap-1 text-[10px] text-muted-foreground hover:text-foreground"
+      >
+        <ChevronDown className={cn('size-3 transition-transform', !advanced && '-rotate-90')} />
+        Advanced (raw args JSON)
+      </button>
+      {advanced && (
+        <Textarea
+          value={argsText}
+          onChange={(e) => setArgsText(e.target.value)}
+          placeholder='{ "target": "src/" }'
+          className="min-h-[44px] resize-none font-mono text-[12px]"
+          spellCheck={false}
+        />
+      )}
+    </div>
+  )
+}
+
 export function RunConfig() {
   const agents = useStore((s) => s.agents)
   const selectedAgent = useStore((s) => s.selectedAgent)
   const selectedMode = useStore((s) => s.selectedMode)
   const cwd = useStore((s) => s.cwd)
   const defaultCwd = useStore((s) => s.defaultCwd)
-  const argsText = useStore((s) => s.argsText)
   const stepMode = useStore((s) => s.stepMode)
   const manualApprovals = useStore((s) => s.manualApprovals)
   const setSelectedAgent = useStore((s) => s.setSelectedAgent)
   const setSelectedMode = useStore((s) => s.setSelectedMode)
   const setCwd = useStore((s) => s.setCwd)
-  const setArgsText = useStore((s) => s.setArgsText)
   const setStepMode = useStore((s) => s.setStepMode)
   const setManualApprovals = useStore((s) => s.setManualApprovals)
   const liveModes = useStore((s) => s.run?.modes)
@@ -222,18 +344,7 @@ export function RunConfig() {
         />
       </div>
 
-      <div className="space-y-1">
-        <Label className="text-[11px] text-muted-foreground">
-          args <span className="text-muted-foreground/60">(JSON, exposed to the script)</span>
-        </Label>
-        <Textarea
-          value={argsText}
-          onChange={(e) => setArgsText(e.target.value)}
-          placeholder='{ "target": "src/" }'
-          className="min-h-[44px] resize-none font-mono text-[12px]"
-          spellCheck={false}
-        />
-      </div>
+      <InputsSection />
 
       <div className="flex items-center justify-between rounded-md border border-border/60 px-2.5 py-1.5">
         <Label htmlFor="stepmode" className="flex items-center gap-1.5 text-[12px]">

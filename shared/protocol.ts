@@ -1,6 +1,7 @@
 import type { AcpAgentId, AcpAgentSpec } from './agents.ts'
 import type { RunEvent, RunSnapshot } from './events.ts'
 import type { PromptParam } from './prompt-frontmatter.ts'
+import type { Json } from './capability.ts'
 
 /** Parameters to launch a workflow run. */
 export interface RunRequest {
@@ -53,6 +54,23 @@ export type PermissionResponse =
   | { kind: 'selected'; optionId: string }
   | { kind: 'cancelled' }
 
+/** A mid-run human-in-the-loop input request (checkpoint / input / select),
+ *  awaiting a value from the host (UI or programmatic onInput handler). */
+export interface InputRequest {
+  requestId: string
+  kind: 'confirm' | 'input' | 'select'
+  prompt: string
+  /** Choices for kind==='select'. */
+  options?: { id: string; label: string }[]
+  default?: Json
+  /** The agent associated with this request, when raised in an agent context. */
+  agentId?: string
+}
+
+export type InputResponse =
+  | { kind: 'value'; value: Json }
+  | { kind: 'cancelled' }
+
 /** Client -> Server WebSocket messages. */
 export type ClientMessage =
   | { t: 'start'; run: RunRequest }
@@ -62,6 +80,7 @@ export type ClientMessage =
   | { t: 'cancel'; runId: string }
   | { t: 'setBreakpoints'; runId: string; lines: number[] }
   | { t: 'permission'; runId: string; requestId: string; response: PermissionResponse }
+  | { t: 'input'; runId: string; requestId: string; response: InputResponse }
   | { t: 'ping' }
 
 /** Server -> Client WebSocket messages. */
@@ -71,6 +90,8 @@ export type ServerMessage =
   | { t: 'event'; runId: string; event: RunEvent }
   | { t: 'permission'; runId: string; req: PermissionRequest }
   | { t: 'permission:resolved'; runId: string; requestId: string }
+  | { t: 'input'; runId: string; req: InputRequest }
+  | { t: 'input:resolved'; runId: string; requestId: string }
   | { t: 'error'; runId?: string; message: string }
   | { t: 'pong' }
 

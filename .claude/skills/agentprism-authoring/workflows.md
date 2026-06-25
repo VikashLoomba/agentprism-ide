@@ -19,10 +19,25 @@ export const meta = {
   prompts: ['mrReview'],             // optional — prompt templates this workflow may call
   model: 'opus',                     // optional — default model for agents with no model set
   config: { verify: { reviewers: 3 } }, // optional — per-method overrides (keyed by method name)
+  inputs: [                          // optional — typed inputs; each becomes a key on `args`
+    { name: 'jiraKey', type: 'string', required: true, description: 'Ticket key' },
+    { name: 'reviewers', type: 'string[]', default: ['alice'] }, // optional, with a default
+  ],
 }
 ```
 
 Only names listed in `meta.capabilities` / `meta.prompts` are injected and typed; calling an undeclared one is a validation error. Qualify with `project:`/`user:`/`@me/` to force a tier (e.g. `'user:jira'`).
+
+### Typed inputs (`meta.inputs`)
+
+`meta.inputs` is an **optional** array of typed parameters. Each entry is `{ name, type, description?, default?, required? }`:
+
+- `name` — a JS identifier; it becomes a key on the `args` global (`args.jiraKey`).
+- `type` — one of `string | number | boolean | string[] | number[] | boolean[]`.
+- `required` — defaults to `false`. A required param with no value blocks the run.
+- `default` — must match `type`; seeds the IDE form and the value when omitted.
+
+When `inputs` is declared, the IDE renders a generated form (one control per param) that **gates Run** until required fields are filled, `args` becomes precisely typed in the editor (no longer `any`), and the values are validated (strictly, no loose coercion) by the same `validateInputs` gate the **programmatic API** enforces before a run starts. Omitting `meta.inputs` keeps today's behavior exactly: free-form `args`, `args: any`, no gating.
 
 ## DSL globals
 

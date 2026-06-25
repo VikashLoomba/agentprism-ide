@@ -16,6 +16,8 @@ import type { AcpAgentId, AcpAgentSpec } from '@shared/agents'
 import { ACP_AGENT_LIST } from '@shared/agents'
 import { CAPABILITY_RESERVED_NAMES, DSL_METHODS } from '@shared/dsl-registry'
 import type { CapabilityCatalogEntry, PromptCatalogEntry } from '@shared/protocol'
+import { paramsToTsType } from '@shared/param'
+import type { WorkflowInputParam } from '@shared/dsl'
 
 const PREAMBLE = `// AgentPrism workflow DSL — ambient globals.
 // Scripts are plain ES modules: the first statement must be
@@ -64,6 +66,19 @@ interface WorkflowMeta {
    *  Resolved project-local tools/ first, then user-level ~/.agentprism/tools/.
    *  Qualify with "user:"/"@me/" to force the user tier or "project:" to force project. */
   capabilities?: string[];
+  /** Optionally declared typed inputs. When present, the run's \`args\` global is
+   *  typed from these and the IDE renders a form that gates Run; required inputs
+   *  must be filled. Absent ⇒ free-form \`args\` (back-compat). */
+  inputs?: {
+    /** JS identifier → key on \`args\`. */
+    name: string;
+    type: "string" | "number" | "boolean" | "string[]" | "number[]" | "boolean[]";
+    description?: string;
+    /** Seed value when omitted; must match \`type\`. */
+    default?: unknown;
+    /** Required inputs gate Run (default false). */
+    required?: boolean;
+  }[];
 }
 
 interface CheckpointOptions {
@@ -141,6 +156,8 @@ function buildAgentOptionsDts(agents: AcpAgentSpec[], defaultAgentId: AcpAgentId
     `  label?: string;`,
     `  /** Override the current phase for this single agent. */`,
     `  phase?: string;`,
+    `  /** Working directory for THIS call; relative resolves against the run cwd. Defaults to the run cwd. */`,
+    `  cwd?: string;`,
     `  /** JSON Schema — agent() resolves to a validated object instead of text. */`,
     `  schema?: JsonSchema;`,
     `  /** Run inside a throwaway git worktree for conflict-free parallel edits. */`,
@@ -206,11 +223,30 @@ function buildPromptsDts(entries: PromptCatalogEntry[]): string | null {
  * one `declare const <ns>` block per scoped capability (meta.capabilities-resolved
  * entries, passed by the caller; collisions with DSL/core globals are skipped).
  */
+/**
+ * The generated `declare const args: { … }` block when a workflow declares
+ * `meta.inputs`. Members are required (`name:`) unless `required !== true`
+ * (`name?:`). This REPLACES the static `args: any` registry entry — emitting a
+ * second top-level `declare const args` would void DSL intellisense.
+ */
+function buildArgsDts(inputs: WorkflowInputParam[]): string {
+  const tsType = paramsToTsType(
+    inputs.map((p) => ({
+      name: p.name,
+      type: p.type,
+      description: p.description,
+      optional: p.required !== true,
+    })),
+  )
+  return `/** Typed inputs declared in meta.inputs. */\ndeclare const args: ${tsType};`
+}
+
 export function buildWorkflowDts(
   agents: AcpAgentSpec[],
   defaultAgentId: AcpAgentId,
   capabilities?: CapabilityCatalogEntry[],
   prompts?: PromptCatalogEntry[],
+  inputs?: WorkflowInputParam[],
 ): string {
   const configInterfaces = agents.map((spec) => buildAgentConfigInterface(spec))
   const agentOptions = buildAgentOptionsDts(agents, defaultAgentId)
@@ -218,14 +254,21 @@ export function buildWorkflowDts(
     .map(buildCapabilityDts)
     .filter((block): block is string => block !== null)
   const promptsDts = buildPromptsDts(prompts ?? [])
+  // When typed inputs are declared, drop the static `args: any` entry and append
+  // the generated typed `declare const args` instead (REPLACE, never duplicate).
+  const hasInputs = !!inputs && inputs.length > 0
+  const methodDts = (hasInputs ? DSL_METHODS.filter((m) => m.name !== 'args') : DSL_METHODS).map(
+    (m) => m.dts,
+  )
   return (
     [
       PREAMBLE,
       ...configInterfaces,
       agentOptions,
-      ...DSL_METHODS.map((m) => m.dts),
+      ...methodDts,
       ...capabilityDts,
       ...(promptsDts ? [promptsDts] : []),
+      ...(hasInputs ? [buildArgsDts(inputs!)] : []),
     ].join('\n\n') + '\n'
   )
 }

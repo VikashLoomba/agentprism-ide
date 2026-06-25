@@ -4,6 +4,8 @@ import type { AcpAgentId, AcpAgentSpec, SessionModeState } from '@shared/agents'
 import type { RunEvent, RunSnapshot } from '@shared/events'
 import type {
   CapabilityCatalogEntry,
+  InputRequest,
+  InputResponse,
   PermissionRequest,
   PermissionResponse,
   PromptCatalogEntry,
@@ -11,9 +13,11 @@ import type {
   ServerMessage,
   WorkflowFileInfo,
 } from '@shared/protocol'
+import type { WorkflowInputParam } from '@shared/dsl'
 import { resolveCapability, type CapabilityCatalog } from '@shared/capability-resolve'
 import { resolvePrompt, type PromptCatalog } from '@shared/prompt-resolve'
 import { validateWorkflow, type ValidateResult } from '@shared/validate'
+import { validateInputs } from '@shared/validate-inputs'
 import { applyRunEvent } from './runReducer'
 import * as api from '@/lib/api'
 import { DEFAULT_WORKFLOW } from '@/lib/defaults'
@@ -32,12 +36,14 @@ function workflowDtsFor(
   defaultAgentId: AcpAgentId,
   capabilities?: CapabilityCatalogEntry[],
   prompts?: PromptCatalogEntry[],
+  inputs?: WorkflowInputParam[],
 ): string {
   return buildWorkflowDts(
     agents.filter((a) => a.installed),
     defaultAgentId,
     capabilities,
     prompts,
+    inputs,
   )
 }
 
@@ -142,6 +148,34 @@ function parseArgs(text: string): unknown {
   }
 }
 
+/** Seed the input form values from each declared param's `default` (omitted
+ *  params stay absent so required-empty gating works). */
+function seedInputValues(inputs: WorkflowInputParam[] | undefined): Record<string, unknown> {
+  const values: Record<string, unknown> = {}
+  for (const input of inputs ?? []) {
+    if (input.default !== undefined) values[input.name] = input.default
+  }
+  return values
+}
+
+/**
+ * Compute the input-related state patch on any validation change:
+ *  - RE-SEED `inputValues` from defaults when the declared `meta.inputs` set
+ *    changes (so stale values don't leak across workflows); otherwise keep the
+ *    user's current values.
+ *  - Derive `inputsValid` via validateInputs, which DEFAULTS TRUE when
+ *    `meta.inputs` is absent/empty (and meta===undefined ⇒ inputs undefined).
+ */
+function inputStatePatch(
+  nextInputs: WorkflowInputParam[] | undefined,
+  prevInputs: WorkflowInputParam[] | undefined,
+  currentValues: Record<string, unknown>,
+): { inputValues: Record<string, unknown>; inputsValid: boolean } {
+  const changed = JSON.stringify(prevInputs) !== JSON.stringify(nextInputs)
+  const inputValues = changed ? seedInputValues(nextInputs) : currentValues
+  return { inputValues, inputsValid: validateInputs(nextInputs, inputValues).ok }
+}
+
 interface State {
   agents: AcpAgentSpec[]
   defaultCwd: string
@@ -178,6 +212,10 @@ interface State {
   selectedMode: string
   cwd: string
   argsText: string
+  /** Values for the generated typed-input form (when meta.inputs present),
+   *  keyed by declared input name. Seeded from defaults, re-seeded when the
+   *  declared inputs change. Built into `args` at run start. */
+  inputValues: Record<string, unknown>
   stepMode: boolean
   manualApprovals: boolean
   maxConcurrency: number
@@ -187,6 +225,11 @@ interface State {
   run: RunSnapshot | null
   activeRunId: string | null
   permission: PermissionRequest | null
+  /** Pending mid-run human-in-the-loop input request (drives InputDialog). */
+  input: InputRequest | null
+  /** Derived: do `inputValues` satisfy the declared `meta.inputs`? DEFAULTS
+   *  TRUE when no inputs are declared / meta is undefined (back-compat). */
+  inputsValid: boolean
 
   files: WorkflowFileInfo[]
   lastError: string | null
@@ -198,6 +241,7 @@ interface State {
   setSelectedMode: (id: string) => void
   setCwd: (c: string) => void
   setArgsText: (s: string) => void
+  setInputValue: (name: string, value: unknown) => void
   setStepMode: (b: boolean) => void
   setManualApprovals: (b: boolean) => void
   setMaxConcurrency: (n: number) => void
@@ -220,6 +264,7 @@ interface State {
   resumeRun: () => void
   stepRun: () => void
   respondPermission: (response: PermissionResponse) => void
+  respondInput: (response: InputResponse) => void
 
   modesForUi: () => SessionModeState
   onServerMessage: (msg: ServerMessage) => void
@@ -260,6 +305,7 @@ export const useStore = create<State>((set, get) => {
     selectedMode: 'default',
     cwd: '',
     argsText: '',
+    inputValues: {},
     stepMode: false,
     manualApprovals: false,
     maxConcurrency: 8,
@@ -268,6 +314,8 @@ export const useStore = create<State>((set, get) => {
     run: null,
     activeRunId: null,
     permission: null,
+    input: null,
+    inputsValid: true,
 
     files: [],
     lastError: null,
@@ -311,8 +359,14 @@ export const useStore = create<State>((set, get) => {
             selectedAgent,
             scopedCapabilityEntries(capabilityCatalog, validation.meta?.capabilities),
             scopedPromptEntries(promptCatalog, validation.meta?.prompts),
+            validation.meta?.inputs,
           ),
           validation,
+          ...inputStatePatch(
+            validation.meta?.inputs,
+            get().validation.meta?.inputs,
+            get().inputValues,
+          ),
         })
       } catch (err) {
         set({ lastError: err instanceof Error ? err.message : String(err) })
@@ -340,6 +394,7 @@ export const useStore = create<State>((set, get) => {
         source,
         dirty: true,
         validation,
+        ...inputStatePatch(validation.meta?.inputs, s.validation.meta?.inputs, s.inputValues),
         ...(capsChanged || promptsChanged
           ? {
               workflowDts: workflowDtsFor(
@@ -347,6 +402,7 @@ export const useStore = create<State>((set, get) => {
                 s.selectedAgent,
                 scopedCapabilityEntries(s.capabilityCatalog, nextCaps),
                 scopedPromptEntries(s.promptCatalog, nextPrompts),
+                validation.meta?.inputs,
               ),
             }
           : {}),
@@ -384,13 +440,20 @@ export const useStore = create<State>((set, get) => {
           id,
           scopedCapabilityEntries(s.capabilityCatalog, validation.meta?.capabilities),
           scopedPromptEntries(s.promptCatalog, validation.meta?.prompts),
+          validation.meta?.inputs,
         ),
         validation,
+        ...inputStatePatch(validation.meta?.inputs, s.validation.meta?.inputs, s.inputValues),
       })
     },
     setSelectedMode: (selectedMode) => set({ selectedMode }),
     setCwd: (cwd) => set({ cwd }),
     setArgsText: (argsText) => set({ argsText }),
+    setInputValue: (name, value) => {
+      const s = get()
+      const inputValues = { ...s.inputValues, [name]: value }
+      set({ inputValues, inputsValid: validateInputs(s.validation.meta?.inputs, inputValues).ok })
+    },
     setStepMode: (stepMode) => set({ stepMode }),
     setManualApprovals: (manualApprovals) => set({ manualApprovals }),
     setMaxConcurrency: (maxConcurrency) => set({ maxConcurrency }),
@@ -435,7 +498,9 @@ export const useStore = create<State>((set, get) => {
             s.selectedAgent,
             scopedCapabilityEntries(capabilityCatalog, validation.meta?.capabilities),
             scopedPromptEntries(s.promptCatalog, validation.meta?.prompts),
+            validation.meta?.inputs,
           ),
+          ...inputStatePatch(validation.meta?.inputs, s.validation.meta?.inputs, s.inputValues),
         })
       } catch (err) {
         set({ lastError: err instanceof Error ? err.message : String(err) })
@@ -463,7 +528,9 @@ export const useStore = create<State>((set, get) => {
             s.selectedAgent,
             scopedCapabilityEntries(s.capabilityCatalog, validation.meta?.capabilities),
             scopedPromptEntries(promptCatalog, validation.meta?.prompts),
+            validation.meta?.inputs,
           ),
+          ...inputStatePatch(validation.meta?.inputs, s.validation.meta?.inputs, s.inputValues),
         })
       } catch (err) {
         set({ lastError: err instanceof Error ? err.message : String(err) })
@@ -500,7 +567,9 @@ export const useStore = create<State>((set, get) => {
           s.selectedAgent,
           scopedCapabilityEntries(s.capabilityCatalog, validation.meta?.capabilities),
           scopedPromptEntries(s.promptCatalog, validation.meta?.prompts),
+          validation.meta?.inputs,
         ),
+        ...inputStatePatch(validation.meta?.inputs, s.validation.meta?.inputs, s.inputValues),
         breakpoints: [],
       })
     },
@@ -589,7 +658,9 @@ export const useStore = create<State>((set, get) => {
           s.selectedAgent,
           scopedCapabilityEntries(s.capabilityCatalog, validation.meta?.capabilities),
           scopedPromptEntries(s.promptCatalog, validation.meta?.prompts),
+          validation.meta?.inputs,
         ),
+        ...inputStatePatch(validation.meta?.inputs, s.validation.meta?.inputs, s.inputValues),
         breakpoints: [],
       })
     },
@@ -602,13 +673,18 @@ export const useStore = create<State>((set, get) => {
       const methodConfig = Object.fromEntries(
         Object.entries(s.methodConfig).filter(([, v]) => v && Object.keys(v).length > 0),
       )
+      // When the workflow declares typed inputs, the generated form IS `args`;
+      // otherwise fall back to the raw args textarea (back-compat).
+      const declaredInputs = s.validation.meta?.inputs
+      const args =
+        declaredInputs && declaredInputs.length > 0 ? s.inputValues : parseArgs(s.argsText)
       const req: RunRequest = {
         runId,
         source: s.source,
         agent: s.selectedAgent,
         modeId: s.selectedMode,
         cwd: s.cwd || s.defaultCwd,
-        args: parseArgs(s.argsText),
+        args,
         breakpoints: s.breakpoints,
         stepMode: s.stepMode,
         manualApprovals: s.manualApprovals,
@@ -616,7 +692,7 @@ export const useStore = create<State>((set, get) => {
         methodConfig: Object.keys(methodConfig).length ? methodConfig : undefined,
       }
       currentRun = newSnapshot(req)
-      set({ activeRunId: runId, run: currentRun, permission: null })
+      set({ activeRunId: runId, run: currentRun, permission: null, input: null })
       ws?.send({ t: 'start', run: req })
     },
 
@@ -638,6 +714,14 @@ export const useStore = create<State>((set, get) => {
       if (activeRunId && permission) {
         ws?.send({ t: 'permission', runId: activeRunId, requestId: permission.requestId, response })
         set({ permission: null })
+      }
+    },
+
+    respondInput(response) {
+      const { activeRunId, input } = get()
+      if (activeRunId && input) {
+        ws?.send({ t: 'input', runId: activeRunId, requestId: input.requestId, response })
+        set({ input: null })
       }
     },
 
@@ -667,8 +751,10 @@ export const useStore = create<State>((set, get) => {
               selectedAgent,
               scopedCapabilityEntries(s.capabilityCatalog, validation.meta?.capabilities),
               scopedPromptEntries(s.promptCatalog, validation.meta?.prompts),
+              validation.meta?.inputs,
             ),
             validation,
+            ...inputStatePatch(validation.meta?.inputs, s.validation.meta?.inputs, s.inputValues),
           })
           break
         }
@@ -690,6 +776,12 @@ export const useStore = create<State>((set, get) => {
           break
         case 'permission:resolved':
           if (get().permission?.requestId === msg.requestId) set({ permission: null })
+          break
+        case 'input':
+          if (msg.runId === get().activeRunId) set({ input: msg.req })
+          break
+        case 'input:resolved':
+          if (get().input?.requestId === msg.requestId) set({ input: null })
           break
         case 'error':
           set({ lastError: msg.message })

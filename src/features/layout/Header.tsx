@@ -9,6 +9,7 @@ import { cn } from '@/lib/utils'
 export function Header() {
   const run = useStore((s) => s.run)
   const validation = useStore((s) => s.validation)
+  const inputsValid = useStore((s) => s.inputsValid)
   const wsStatus = useStore((s) => s.wsStatus)
   const fileName = useStore((s) => s.fileName)
   const dirty = useStore((s) => s.dirty)
@@ -21,7 +22,7 @@ export function Header() {
   const errors = validation.diagnostics.filter((d) => d.severity === 'error').length
   const isActive = !!run && !run.finishedAt && run.status !== 'completed' && run.status !== 'failed' && run.status !== 'cancelled'
   const paused = run?.status === 'paused'
-  const canRun = validation.ok && wsStatus === 'open' && !isActive
+  const canRun = validation.ok && inputsValid && wsStatus === 'open' && !isActive
 
   async function handleSave() {
     try {
@@ -103,7 +104,18 @@ export function Header() {
             Stop
           </Button>
         ) : (
-          <Button size="sm" onClick={startRun} disabled={!canRun} title={!validation.ok ? 'Fix validation errors first' : 'Run workflow'}>
+          <Button
+            size="sm"
+            onClick={startRun}
+            disabled={!canRun}
+            title={
+              !validation.ok
+                ? 'Fix validation errors first'
+                : !inputsValid
+                  ? 'Fill required inputs'
+                  : 'Run workflow'
+            }
+          >
             <Play className="size-4" />
             Run
           </Button>
