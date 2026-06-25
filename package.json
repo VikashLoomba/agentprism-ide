@@ -2,6 +2,7 @@
   "name": "prism-editor-web",
   "private": true,
   "version": "0.0.0",
+  "license": "BUSL-1.1",
   "type": "module",
   "scripts": {
     "dev": "concurrently -k -n web,server -c magenta,cyan \"npm:dev:web\" \"npm:dev:server\"",

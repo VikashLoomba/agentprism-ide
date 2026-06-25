@@ -150,3 +150,17 @@ workflows/   Saved workflow .js files
 - The vm sandbox is **not** a security boundary — workflows are trusted code you write. The ACP **mode** you pick (e.g. Claude `plan`, Codex `read-only`) governs what the agents may do.
 - `opts.isolation: 'worktree'` is surfaced/logged but not yet enforced.
 - `workflow()` supports inline script strings (one level deep), not saved‑name resolution.
+
+## License
+
+AgentPrism is © Loomba Enterprises LLC (d/b/a Automata Labs) and distributed under the **[Business Source License 1.1](./LICENSE)** (`BUSL-1.1`).
+
+In plain terms:
+
+- ✅ You may read, modify, and **run it locally or on your own infrastructure — including for commercial work** (e.g. building and running your own agent workflows).
+- 🚫 You may **not** offer AgentPrism to third parties as a hosted or managed service that competes with a paid Automata Labs offering.
+- ⏳ Each released version automatically converts to the **Apache License 2.0** on its Change Date (four years after that version's release).
+
+BSL is **source‑available**, not OSI "open source," until the Change Date. For commercial licensing outside these terms, contact `vikash@automatalabs.io`.
+
+Contributions are welcome under a **[Contributor License Agreement](./CLA.md)** — see **[CONTRIBUTING.md](./CONTRIBUTING.md)**.
