@@ -139,6 +139,10 @@ Key globals (full types power editor intellisense — see `src/lib/workflow-dts.
 
 Example workflows live in `workflows/` (`auth_audit.js`, `codebase_review.js`, `dual_backend_review.js`).
 
+## Authoring with an AI agent
+
+Point your coding agent at the **[`agentprism-authoring`](.claude/skills/agentprism-authoring/SKILL.md)** skill (`.claude/skills/agentprism-authoring/`). It teaches an agent *where* and *how* to write **workflows**, **prompt templates**, and **tools**, routing to a focused guide per task. In Claude Code it loads automatically; with any other agent, point it at the `SKILL.md` and the linked files.
+
 ## Project layout
 
 ```
