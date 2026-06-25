@@ -44,6 +44,17 @@ Rules:
   - return `null` on a **recoverable** failure (and `ctx.log(...)` it) — workflows treat a `null` result as "soft fail," same as `agent()`.
 - The workflow sees the method with **`ctx` dropped and always async**: `jira.getTicket(args) => Promise<{ key; acceptanceCriteria } | null>`.
 - A workflow must list `'jira'` in `meta.capabilities` to call it.
+- **One namespace per file.** A capability module has a single `export default defineCapability(...)`, and the catalog is keyed by filename — so `tools/jira.ts` defines exactly one namespace (`jira`). For a second namespace (e.g. `confluence`), add a second file.
+
+Group related powers as **many effects under one namespace**, not many files: `jira.getTicket`, `jira.createTicket`, `jira.addComment` all live in `tools/jira.ts`. To keep a large capability readable, split the effect implementations into other modules and just assemble them — the capability is host-loaded with a real `import()`, so it can import from anywhere:
+
+```ts
+// tools/jira.ts
+import { getTicket, createTicket } from '../lib/jira/effects.ts'
+export default defineCapability({ name: 'jira', secrets: ['JIRA_TOKEN'], effects: { getTicket, createTicket } })
+```
+
+Keep those implementation files **out of the flat-scanned `tools/` top level** (a subdirectory like `tools/_jira/`, or a different directory) so they're never picked up as their own capability — only `*.ts`/`*.js`/`*.mjs` directly in `tools/` (and `~/.agentprism/tools/`) are scanned.
 
 ---
 
