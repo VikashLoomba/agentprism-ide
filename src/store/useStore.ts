@@ -1,14 +1,16 @@
 import { create } from 'zustand'
 import { nanoid } from 'nanoid'
 import type { AcpAgentId, AcpAgentSpec, SessionModeState } from '@shared/agents'
-import type { RunSnapshot } from '@shared/events'
+import type { RunEvent, RunSnapshot } from '@shared/events'
 import type {
+  CapabilityCatalogEntry,
   PermissionRequest,
   PermissionResponse,
   RunRequest,
   ServerMessage,
   WorkflowFileInfo,
 } from '@shared/protocol'
+import { resolveCapability, type CapabilityCatalog } from '@shared/capability-resolve'
 import { validateWorkflow, type ValidateResult } from '@shared/validate'
 import { applyRunEvent } from './runReducer'
 import * as api from '@/lib/api'
@@ -21,12 +23,40 @@ function installedAgentIds(agents: AcpAgentSpec[]): AcpAgentId[] {
   return agents.filter((a) => a.installed).map((a) => a.id)
 }
 
-/** Regenerate the Monaco DSL .d.ts for the connected agents + the default. */
-function workflowDtsFor(agents: AcpAgentSpec[], defaultAgentId: AcpAgentId): string {
+/** Regenerate the Monaco DSL .d.ts for the connected agents + the default, scoped
+ *  to the capability entries the current workflow's `meta.capabilities` resolve to. */
+function workflowDtsFor(
+  agents: AcpAgentSpec[],
+  defaultAgentId: AcpAgentId,
+  capabilities?: CapabilityCatalogEntry[],
+): string {
   return buildWorkflowDts(
     agents.filter((a) => a.installed),
     defaultAgentId,
+    capabilities,
   )
+}
+
+/** Build the isomorphic project>user catalog view from the flat fetched entry list. */
+function buildCapabilityCatalog(entries: CapabilityCatalogEntry[]): CapabilityCatalog {
+  const catalog: CapabilityCatalog = { project: {}, user: {} }
+  for (const entry of entries) catalog[entry.tier][entry.name] = entry
+  return catalog
+}
+
+/** The catalog entries a workflow's `meta.capabilities` resolve to (project-first),
+ *  used to scope the dts so only declared namespaces appear. */
+function scopedCapabilityEntries(
+  catalog: CapabilityCatalog,
+  metaCapabilities: string[] | undefined,
+): CapabilityCatalogEntry[] {
+  if (!metaCapabilities) return []
+  const out: CapabilityCatalogEntry[] = []
+  for (const raw of metaCapabilities) {
+    const res = resolveCapability(catalog, raw)
+    if (res.resolved) out.push(catalog[res.resolved][res.bareName])
+  }
+  return out
 }
 
 let ws: WsClient | null = null
@@ -41,11 +71,39 @@ function newSnapshot(req: RunRequest): RunSnapshot {
     cwd: req.cwd,
     phases: [],
     agents: [],
+    effects: [],
     log: [],
     stats: { agentCount: 0, completed: 0, failed: 0, durationMs: 0, tokens: {} },
     breakpoints: req.breakpoints,
     startedAt: Date.now(),
   }
+}
+
+/** Reduce the two `effect:*` events into `run.effects`, mirroring how `agent:*`
+ *  upserts into `run.agents` (keyed by id) and groups under its phase. `applyRunEvent`
+ *  has no case for these, so the store reduces them here. */
+function reduceEffectEvent(run: RunSnapshot, event: RunEvent): boolean {
+  if (event.type === 'effect:started') {
+    const existing = run.effects.find((e) => e.id === event.effect.id)
+    if (existing) Object.assign(existing, event.effect)
+    else run.effects.push(event.effect)
+    const phase = run.phases.find((p) => p.title === event.effect.phase)
+    if (phase && !(phase.effectIds ??= []).includes(event.effect.id)) {
+      phase.effectIds.push(event.effect.id)
+    }
+    return true
+  }
+  if (event.type === 'effect:finished') {
+    const effect = run.effects.find((e) => e.id === event.effectId)
+    if (effect) {
+      effect.status = event.status
+      if (event.status === 'ok') effect.result = event.result
+      else effect.error = event.error
+      effect.finishedAt = (effect.startedAt ?? Date.now()) + event.durationMs
+    }
+    return true
+  }
+  return false
 }
 
 function parseArgs(text: string): unknown {
@@ -62,6 +120,11 @@ interface State {
   agents: AcpAgentSpec[]
   defaultCwd: string
   wsStatus: WsStatus
+
+  /** Flat list of every available capability (both tiers), from /api/capabilities. */
+  capabilities: CapabilityCatalogEntry[]
+  /** Derived project>user view of `capabilities`, threaded into validateWorkflow. */
+  capabilityCatalog: CapabilityCatalog
 
   source: string
   fileName: string | null
@@ -103,6 +166,7 @@ interface State {
   clearMethodConfigField: (method: string, key: string) => void
   resetMethodConfig: (method: string) => void
 
+  refreshCapabilities: () => Promise<void>
   refreshFiles: () => Promise<void>
   openFile: (name: string) => Promise<void>
   saveCurrent: (name?: string) => Promise<WorkflowFileInfo | undefined>
@@ -133,6 +197,9 @@ export const useStore = create<State>((set, get) => {
     agents: [],
     defaultCwd: '',
     wsStatus: 'connecting',
+
+    capabilities: [],
+    capabilityCatalog: { project: {}, user: {} },
 
     source: DEFAULT_WORKFLOW,
     fileName: null,
@@ -166,17 +233,33 @@ export const useStore = create<State>((set, get) => {
         })
       }
       try {
-        const { agents, defaultCwd } = await api.fetchAgents()
+        const [{ agents, defaultCwd }, { capabilities }] = await Promise.all([
+          api.fetchAgents(),
+          api.fetchCapabilities(),
+        ])
+        const capabilityCatalog = buildCapabilityCatalog(capabilities)
         const selected = agents.find((a) => a.installed) ?? agents[0]
         const selectedAgent = selected?.id ?? 'claude'
+        const validation = validateWorkflow(
+          get().source,
+          selectedAgent,
+          installedAgentIds(agents),
+          capabilityCatalog,
+        )
         set({
           agents,
           defaultCwd,
+          capabilities,
+          capabilityCatalog,
           cwd: get().cwd || defaultCwd,
           selectedAgent,
           selectedMode: selected?.defaultModes.currentModeId ?? 'default',
-          workflowDts: workflowDtsFor(agents, selectedAgent),
-          validation: validateWorkflow(get().source, selectedAgent, installedAgentIds(agents)),
+          workflowDts: workflowDtsFor(
+            agents,
+            selectedAgent,
+            scopedCapabilityEntries(capabilityCatalog, validation.meta?.capabilities),
+          ),
+          validation,
         })
       } catch (err) {
         set({ lastError: err instanceof Error ? err.message : String(err) })
@@ -185,10 +268,30 @@ export const useStore = create<State>((set, get) => {
     },
 
     setSource(source) {
+      const s = get()
+      const prevCaps = s.validation.meta?.capabilities
+      const validation = validateWorkflow(
+        source,
+        s.selectedAgent,
+        installedAgentIds(s.agents),
+        s.capabilityCatalog,
+      )
+      const nextCaps = validation.meta?.capabilities
+      // Re-inject capability dts only when the declared `meta.capabilities` set changes.
+      const capsChanged = JSON.stringify(prevCaps) !== JSON.stringify(nextCaps)
       set({
         source,
         dirty: true,
-        validation: validateWorkflow(source, get().selectedAgent, installedAgentIds(get().agents)),
+        validation,
+        ...(capsChanged
+          ? {
+              workflowDts: workflowDtsFor(
+                s.agents,
+                s.selectedAgent,
+                scopedCapabilityEntries(s.capabilityCatalog, nextCaps),
+              ),
+            }
+          : {}),
       })
     },
 
@@ -205,13 +308,24 @@ export const useStore = create<State>((set, get) => {
     },
 
     setSelectedAgent(id) {
-      const agents = get().agents
+      const s = get()
+      const agents = s.agents
       const spec = agents.find((a) => a.id === id)
+      const validation = validateWorkflow(
+        s.source,
+        id,
+        installedAgentIds(agents),
+        s.capabilityCatalog,
+      )
       set({
         selectedAgent: id,
         selectedMode: spec?.defaultModes.currentModeId ?? 'default',
-        workflowDts: workflowDtsFor(agents, id),
-        validation: validateWorkflow(get().source, id, installedAgentIds(agents)),
+        workflowDts: workflowDtsFor(
+          agents,
+          id,
+          scopedCapabilityEntries(s.capabilityCatalog, validation.meta?.capabilities),
+        ),
+        validation,
       })
     },
     setSelectedMode: (selectedMode) => set({ selectedMode }),
@@ -240,6 +354,32 @@ export const useStore = create<State>((set, get) => {
       set({ methodConfig: next })
     },
 
+    async refreshCapabilities() {
+      try {
+        const { capabilities } = await api.fetchCapabilities()
+        const capabilityCatalog = buildCapabilityCatalog(capabilities)
+        const s = get()
+        const validation = validateWorkflow(
+          s.source,
+          s.selectedAgent,
+          installedAgentIds(s.agents),
+          capabilityCatalog,
+        )
+        set({
+          capabilities,
+          capabilityCatalog,
+          validation,
+          workflowDts: workflowDtsFor(
+            s.agents,
+            s.selectedAgent,
+            scopedCapabilityEntries(capabilityCatalog, validation.meta?.capabilities),
+          ),
+        })
+      } catch (err) {
+        set({ lastError: err instanceof Error ? err.message : String(err) })
+      }
+    },
+
     async refreshFiles() {
       try {
         set({ files: await api.fetchFiles() })
@@ -250,11 +390,23 @@ export const useStore = create<State>((set, get) => {
 
     async openFile(name) {
       const { content } = await api.fetchFile(name)
+      const s = get()
+      const validation = validateWorkflow(
+        content,
+        s.selectedAgent,
+        installedAgentIds(s.agents),
+        s.capabilityCatalog,
+      )
       set({
         source: content,
         fileName: name,
         dirty: false,
-        validation: validateWorkflow(content, get().selectedAgent, installedAgentIds(get().agents)),
+        validation,
+        workflowDts: workflowDtsFor(
+          s.agents,
+          s.selectedAgent,
+          scopedCapabilityEntries(s.capabilityCatalog, validation.meta?.capabilities),
+        ),
         breakpoints: [],
       })
     },
@@ -275,14 +427,22 @@ export const useStore = create<State>((set, get) => {
     },
 
     newFile() {
+      const s = get()
+      const validation = validateWorkflow(
+        DEFAULT_WORKFLOW,
+        s.selectedAgent,
+        installedAgentIds(s.agents),
+        s.capabilityCatalog,
+      )
       set({
         source: DEFAULT_WORKFLOW,
         fileName: null,
         dirty: false,
-        validation: validateWorkflow(
-          DEFAULT_WORKFLOW,
-          get().selectedAgent,
-          installedAgentIds(get().agents),
+        validation,
+        workflowDts: workflowDtsFor(
+          s.agents,
+          s.selectedAgent,
+          scopedCapabilityEntries(s.capabilityCatalog, validation.meta?.capabilities),
         ),
         breakpoints: [],
       })
@@ -345,15 +505,22 @@ export const useStore = create<State>((set, get) => {
     onServerMessage(msg) {
       switch (msg.t) {
         case 'hello': {
-          const selectedAgent = get().selectedAgent
+          const s = get()
+          const selectedAgent = s.selectedAgent
+          const validation = validateWorkflow(
+            s.source,
+            selectedAgent,
+            installedAgentIds(msg.agents),
+            s.capabilityCatalog,
+          )
           set({
             agents: msg.agents,
-            workflowDts: workflowDtsFor(msg.agents, selectedAgent),
-            validation: validateWorkflow(
-              get().source,
+            workflowDts: workflowDtsFor(
+              msg.agents,
               selectedAgent,
-              installedAgentIds(msg.agents),
+              scopedCapabilityEntries(s.capabilityCatalog, validation.meta?.capabilities),
             ),
+            validation,
           })
           break
         }
@@ -365,7 +532,8 @@ export const useStore = create<State>((set, get) => {
           break
         case 'event':
           if (currentRun && msg.runId === get().activeRunId) {
-            applyRunEvent(currentRun, msg.event)
+            // effect:* have no case in applyRunEvent — the store reduces them here.
+            if (!reduceEffectEvent(currentRun, msg.event)) applyRunEvent(currentRun, msg.event)
             scheduleFlush()
           }
           break

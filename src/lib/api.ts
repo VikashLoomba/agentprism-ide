@@ -1,4 +1,9 @@
-import type { AgentsResponse, WorkflowFileContent, WorkflowFileInfo } from '@shared/protocol'
+import type {
+  AgentsResponse,
+  CapabilitiesResponse,
+  WorkflowFileContent,
+  WorkflowFileInfo,
+} from '@shared/protocol'
 
 async function json<T>(res: Response): Promise<T> {
   if (!res.ok) {
@@ -10,6 +15,10 @@ async function json<T>(res: Response): Promise<T> {
 
 export function fetchAgents(): Promise<AgentsResponse> {
   return fetch('/api/agents').then((r) => json<AgentsResponse>(r))
+}
+
+export function fetchCapabilities(): Promise<CapabilitiesResponse> {
+  return fetch('/api/capabilities').then((r) => json<CapabilitiesResponse>(r))
 }
 
 export function fetchFiles(): Promise<WorkflowFileInfo[]> {

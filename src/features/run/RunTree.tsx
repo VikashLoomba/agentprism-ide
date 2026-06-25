@@ -10,8 +10,9 @@ import {
   Wrench,
   Brain,
   Hash,
+  Zap,
 } from 'lucide-react'
-import type { AgentCallState, AgentCallStatus, RunSnapshot } from '@shared/events'
+import type { AgentCallState, AgentCallStatus, EffectCallState, EffectCallStatus, RunSnapshot } from '@shared/events'
 import type { AcpAgentId } from '@shared/agents'
 import { useStore } from '@/store/useStore'
 import { ScrollArea } from '@/components/ui/scroll-area'
@@ -24,6 +25,22 @@ const STATUS_ICON: Record<AgentCallStatus, { icon: typeof Circle; className: str
   completed: { icon: CheckCircle2, className: 'text-success' },
   failed: { icon: XCircle, className: 'text-destructive' },
   skipped: { icon: CircleSlash, className: 'text-muted-foreground' },
+}
+
+const EFFECT_STATUS_ICON: Record<EffectCallStatus, { icon: typeof Circle; className: string; spin?: boolean }> = {
+  running: { icon: Loader2, className: 'text-info', spin: true },
+  ok: { icon: CheckCircle2, className: 'text-success' },
+  error: { icon: XCircle, className: 'text-destructive' },
+}
+
+/** Compact one-line JSON preview for effect args/result. */
+function previewJson(value: unknown): string {
+  if (value === undefined) return ''
+  try {
+    return JSON.stringify(value)
+  } catch {
+    return String(value)
+  }
 }
 
 /** Fallback display names, used before the agents list loads. */
@@ -139,6 +156,61 @@ function AgentCard({ agent, paused }: { agent: AgentCallState; paused: boolean }
   )
 }
 
+function EffectCard({ effect }: { effect: EffectCallState }) {
+  const [open, setOpen] = useState(false)
+  const cfg = EFFECT_STATUS_ICON[effect.status]
+  const Icon = cfg.icon
+  const duration =
+    effect.startedAt != null && effect.finishedAt != null ? effect.finishedAt - effect.startedAt : null
+  const argsPreview = previewJson(effect.args)
+  const resultPreview = previewJson(effect.result)
+  const preview = (effect.status === 'ok' ? resultPreview : argsPreview).slice(0, 160).trim()
+
+  return (
+    <div className="rounded-md border border-border/60 bg-card/40 transition-colors">
+      <button onClick={() => setOpen((v) => !v)} className="flex w-full items-center gap-2 px-2.5 py-1.5 text-left">
+        <ChevronRight className={cn('size-3.5 shrink-0 text-muted-foreground transition-transform', open && 'rotate-90')} />
+        <Zap className="size-3.5 shrink-0 text-primary/70" />
+        <Icon className={cn('size-4 shrink-0', cfg.className, cfg.spin && 'animate-spin')} />
+        <span className="min-w-0 flex-1 truncate font-mono text-[12px] font-medium">
+          {effect.capability}.{effect.method}
+        </span>
+        {duration != null && (
+          <span className="text-[10px] tabular-nums text-muted-foreground">{duration}ms</span>
+        )}
+        {effect.line != null && (
+          <span className="inline-flex items-center gap-0.5 text-[10px] tabular-nums text-muted-foreground">
+            <Hash className="size-2.5" />
+            {effect.line}
+          </span>
+        )}
+      </button>
+
+      {!open && preview && (
+        <div className="truncate px-2.5 pb-1.5 pl-8 font-mono text-[11px] text-muted-foreground">{preview}</div>
+      )}
+
+      {open && (
+        <div className="space-y-2 border-t border-border/50 px-2.5 py-2 text-[12px]">
+          {argsPreview && (
+            <Field label="Args" mono>
+              {argsPreview}
+            </Field>
+          )}
+          {effect.status === 'ok' && resultPreview && (
+            <Field label="Result" mono>
+              {resultPreview}
+            </Field>
+          )}
+          {effect.error && (
+            <div className="rounded bg-destructive/10 px-2 py-1 text-[11px] text-destructive">{effect.error}</div>
+          )}
+        </div>
+      )}
+    </div>
+  )
+}
+
 function Field({
   label,
   children,
@@ -171,15 +243,22 @@ function Field({
 export function RunTree({ run }: { run: RunSnapshot }) {
   const pauseAgentId = useStore((s) => s.run?.pause?.agentId)
   const byId = new Map(run.agents.map((a) => [a.id, a]))
+  const effects = run.effects ?? []
+  const effectById = new Map(effects.map((e) => [e.id, e]))
   const grouped = run.phases
-    .map((p) => ({ phase: p, agents: p.agentIds.map((id) => byId.get(id)).filter(Boolean) as AgentCallState[] }))
-    .filter((g) => g.agents.length > 0 || run.phases.length > 1)
+    .map((p) => ({
+      phase: p,
+      agents: p.agentIds.map((id) => byId.get(id)).filter(Boolean) as AgentCallState[],
+      effects: (p.effectIds ?? []).map((id) => effectById.get(id)).filter(Boolean) as EffectCallState[],
+    }))
+    .filter((g) => g.agents.length > 0 || g.effects.length > 0 || run.phases.length > 1)
   const ungrouped = run.agents.filter((a) => !run.phases.some((p) => p.agentIds.includes(a.id)))
+  const ungroupedEffects = effects.filter((e) => !run.phases.some((p) => (p.effectIds ?? []).includes(e.id)))
 
   return (
     <ScrollArea className="h-full">
       <div className="space-y-3 p-3">
-        {grouped.map(({ phase, agents }) => (
+        {grouped.map(({ phase, agents, effects: phaseEffects }) => (
           <div key={phase.title}>
             <div className="mb-1.5 flex items-center gap-2">
               <span className="text-[11px] font-semibold uppercase tracking-wider text-foreground/80">{phase.title}</span>
@@ -192,18 +271,26 @@ export function RunTree({ run }: { run: RunSnapshot }) {
               {agents.map((a) => (
                 <AgentCard key={a.id} agent={a} paused={a.id === pauseAgentId} />
               ))}
-              {agents.length === 0 && <p className="pl-1 text-[11px] text-muted-foreground/70">no agents yet</p>}
+              {phaseEffects.map((e) => (
+                <EffectCard key={e.id} effect={e} />
+              ))}
+              {agents.length === 0 && phaseEffects.length === 0 && (
+                <p className="pl-1 text-[11px] text-muted-foreground/70">no activity yet</p>
+              )}
             </div>
           </div>
         ))}
-        {ungrouped.length > 0 && (
+        {(ungrouped.length > 0 || ungroupedEffects.length > 0) && (
           <div className="space-y-1.5">
             {ungrouped.map((a) => (
               <AgentCard key={a.id} agent={a} paused={a.id === pauseAgentId} />
             ))}
+            {ungroupedEffects.map((e) => (
+              <EffectCard key={e.id} effect={e} />
+            ))}
           </div>
         )}
-        {run.agents.length === 0 && (
+        {run.agents.length === 0 && effects.length === 0 && (
           <p className="py-8 text-center text-xs text-muted-foreground">
             No agents have started yet. Agents appear here as the workflow runs.
           </p>

@@ -14,7 +14,8 @@
  */
 import type { AcpAgentId, AcpAgentSpec } from '@shared/agents'
 import { ACP_AGENT_LIST } from '@shared/agents'
-import { DSL_METHODS } from '@shared/dsl-registry'
+import { CAPABILITY_RESERVED_NAMES, DSL_METHODS } from '@shared/dsl-registry'
+import type { CapabilityCatalogEntry } from '@shared/protocol'
 
 const PREAMBLE = `// AgentPrism workflow DSL — ambient globals.
 // Scripts are plain ES modules: the first statement must be
@@ -59,6 +60,10 @@ interface WorkflowMeta {
   model?: string;
   /** Per-method config overrides, e.g. { verify: { reviewers: 3 } }. */
   config?: Record<string, Record<string, unknown>>;
+  /** World-touching capabilities this workflow uses, by namespace name.
+   *  Resolved project-local tools/ first, then user-level ~/.agentprism/tools/.
+   *  Qualify with "user:"/"@me/" to force the user tier or "project:" to force project. */
+  capabilities?: string[];
 }
 
 interface CheckpointOptions {
@@ -157,20 +162,51 @@ function buildAgentOptionsDts(agents: AcpAgentSpec[], defaultAgentId: AcpAgentId
 }
 
 /**
+ * One `declare const <ns>: { … }` ambient block per capability the workflow uses.
+ *
+ * The method surface is the capability's hand-written `dts` body, or a loose index
+ * signature when absent. Each namespace is a global, like the DSL methods.
+ *
+ * C1 (capability-system-design §8): a capability whose name collides with a DSL
+ * global (agent/args/cwd/budget/phase/…) or a core JS global is SKIPPED here, never
+ * relying solely on the runtime executor guard — emitting a second top-level ambient
+ * `declare const args` would silently void DSL intellisense (semantic validation is off).
+ */
+function buildCapabilityDts(entry: CapabilityCatalogEntry): string | null {
+  if (CAPABILITY_RESERVED_NAMES.has(entry.name)) return null
+  const body = entry.dts?.trim() ? entry.dts : '[method: string]: (args: any) => Promise<any>;'
+  return `declare const ${entry.name}: {\n${body}\n};`
+}
+
+/**
  * Build the full ambient `.d.ts` injected into Monaco, given the CONNECTED agents
  * and the current DEFAULT agent. The result is DYNAMIC: it must be regenerated and
  * re-injected whenever the connected-agents list or the default agent changes, so
  * that config completions narrow correctly on `opts.agent`.
  *
  * Concatenates: PREAMBLE (sans AgentOptions) + one config interface per agent +
- * the discriminated AgentOptions union + every registry method's declaration block.
+ * the discriminated AgentOptions union + every registry method's declaration block +
+ * one `declare const <ns>` block per scoped capability (meta.capabilities-resolved
+ * entries, passed by the caller; collisions with DSL/core globals are skipped).
  */
-export function buildWorkflowDts(agents: AcpAgentSpec[], defaultAgentId: AcpAgentId): string {
+export function buildWorkflowDts(
+  agents: AcpAgentSpec[],
+  defaultAgentId: AcpAgentId,
+  capabilities?: CapabilityCatalogEntry[],
+): string {
   const configInterfaces = agents.map((spec) => buildAgentConfigInterface(spec))
   const agentOptions = buildAgentOptionsDts(agents, defaultAgentId)
+  const capabilityDts = (capabilities ?? [])
+    .map(buildCapabilityDts)
+    .filter((block): block is string => block !== null)
   return (
-    [PREAMBLE, ...configInterfaces, agentOptions, ...DSL_METHODS.map((m) => m.dts)].join('\n\n') +
-    '\n'
+    [
+      PREAMBLE,
+      ...configInterfaces,
+      agentOptions,
+      ...DSL_METHODS.map((m) => m.dts),
+      ...capabilityDts,
+    ].join('\n\n') + '\n'
   )
 }
 

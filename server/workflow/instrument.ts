@@ -43,8 +43,15 @@ export interface InstrumentResult {
  * (replaced with spaces) rather than removed, so `meta` becomes an unused local
  * const and **every other line/column is preserved**. That lets us map V8
  * stack-trace lines straight back to the user's source for breakpoints.
+ *
+ * `headerBindings` carries the single-line `const { … } = (() => { … })();`
+ * bindings emitted by the pure-helper inlining transform (see inline.ts). They
+ * are placed between the determinism prelude and the IIFE wrap, and `headerLines`
+ * is computed from the actual emitted header so the `codeLine − headerLines`
+ * source-line mapping stays correct. Defaults to '' so existing callers (no
+ * inlined helpers) compile and behave unchanged.
  */
-export function instrumentWorkflow(normalizedSource: string): InstrumentResult {
+export function instrumentWorkflow(normalizedSource: string, headerBindings = ''): InstrumentResult {
   let src = normalizedSource
   try {
     const ast = parse(normalizedSource, {
@@ -66,7 +73,7 @@ export function instrumentWorkflow(normalizedSource: string): InstrumentResult {
     // the raw source and let the vm surface the error.
   }
 
-  const header = `${DETERMINISM_PRELUDE}\n${WRAP_OPEN}`
+  const header = `${DETERMINISM_PRELUDE}\n${headerBindings ? `${headerBindings}\n` : ''}${WRAP_OPEN}`
   const headerLines = (header.match(/\n/g) ?? []).length
   const code = `${header}${src}${WRAP_CLOSE}`
   return { code, headerLines }

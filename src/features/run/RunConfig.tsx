@@ -1,5 +1,17 @@
-import { Cpu, FolderOpen, Bug, ShieldQuestion } from 'lucide-react'
+import { useState } from 'react'
+import {
+  Cpu,
+  FolderOpen,
+  Bug,
+  ShieldQuestion,
+  KeyRound,
+  Plug,
+  ChevronDown,
+  Check,
+  AlertTriangle,
+} from 'lucide-react'
 import type { AcpAgentId } from '@shared/agents'
+import type { CapabilityCatalogEntry } from '@shared/protocol'
 import { useStore } from '@/store/useStore'
 import {
   Select,
@@ -12,7 +24,128 @@ import { Input } from '@/components/ui/input'
 import { Textarea } from '@/components/ui/textarea'
 import { Label } from '@/components/ui/label'
 import { Switch } from '@/components/ui/switch'
+import { Badge } from '@/components/ui/badge'
+import { cn } from '@/lib/utils'
 import { MethodConfig } from './MethodConfig'
+
+/** Bare name of a `meta.capabilities` ref, dropping any `name@tier`/`./tools`-style qualifier. */
+function bareCapName(ref: string): string {
+  const at = ref.indexOf('@')
+  return (at === -1 ? ref : ref.slice(0, at)).trim()
+}
+
+/** The catalog entries actually referenced by the workflow, project-tier preferred (shadowing). */
+function usedCapabilities(
+  declared: string[],
+  catalog: CapabilityCatalogEntry[],
+): Array<CapabilityCatalogEntry & { shadowsUser: boolean }> {
+  const out: Array<CapabilityCatalogEntry & { shadowsUser: boolean }> = []
+  for (const ref of declared) {
+    const name = bareCapName(ref)
+    const matches = catalog.filter((c) => c.name === name)
+    if (matches.length === 0) continue
+    const project = matches.find((c) => c.tier === 'project')
+    const chosen = project ?? matches[0]
+    const shadowsUser = chosen.tier === 'project' && matches.some((c) => c.tier === 'user')
+    out.push({ ...chosen, shadowsUser })
+  }
+  return out
+}
+
+/**
+ * Read-only per-secret required/present status for the used capabilities.
+ * NEVER an Input — plaintext secret values never reach the client.
+ */
+function SecretsPanel() {
+  const declared = useStore((s) => s.validation.meta?.capabilities)
+  const catalog = useStore((s) => s.capabilities)
+  const used = usedCapabilities(declared ?? [], catalog ?? [])
+  const rows = used.filter((c) => c.secrets.length > 0)
+  if (rows.length === 0) return null
+
+  return (
+    <div className="space-y-2 rounded-md border border-border/60 px-2.5 py-2">
+      <div className="flex items-center gap-1.5 text-[12px] text-foreground/90">
+        <KeyRound className="size-3.5 text-warning" /> Secrets
+        <span className="ml-auto text-[10px] text-muted-foreground">required by used tools · status only</span>
+      </div>
+      <div className="space-y-2">
+        {rows.map((cap) => (
+          <div key={`${cap.tier}:${cap.name}`} className="space-y-1">
+            <span className="font-mono text-[11px] font-semibold text-primary/90">{cap.name}</span>
+            <div className="space-y-1 pl-1">
+              {cap.secrets.map((secret) => {
+                const present = cap.secretStatus?.[secret]?.present ?? false
+                return (
+                  <div key={secret} className="flex items-center justify-between gap-2">
+                    <span className="font-mono text-[11px] text-muted-foreground">{secret}</span>
+                    {present ? (
+                      <Badge variant="outline" className="gap-1 border-success/40 text-success">
+                        <Check className="size-3" /> present
+                      </Badge>
+                    ) : (
+                      <Badge variant="outline" className="gap-1 border-warning/40 text-warning">
+                        <AlertTriangle className="size-3" /> required
+                      </Badge>
+                    )}
+                  </div>
+                )
+              })}
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  )
+}
+
+/** Collapsible read-only view of the capabilities this workflow declares (name, tier, shadow note). */
+function CapabilitiesPanel() {
+  const [open, setOpen] = useState(false)
+  const declared = useStore((s) => s.validation.meta?.capabilities)
+  const catalog = useStore((s) => s.capabilities)
+  const used = usedCapabilities(declared ?? [], catalog ?? [])
+  if (used.length === 0) return null
+
+  return (
+    <div className="rounded-md border border-border/60">
+      <button
+        onClick={() => setOpen((o) => !o)}
+        className="flex w-full items-center gap-1.5 px-2.5 py-1.5 text-[12px] text-foreground/90 hover:text-foreground"
+      >
+        <Plug className="size-3.5 text-primary" /> Capabilities
+        <span className="rounded bg-primary/20 px-1 text-[9px] tabular-nums text-primary">{used.length}</span>
+        <span className="ml-auto text-[10px] text-muted-foreground">shared tools this run can touch</span>
+        <ChevronDown className={cn('size-3.5 transition-transform', !open && '-rotate-90')} />
+      </button>
+      {open && (
+        <div className="space-y-2 border-t border-border/50 px-2.5 py-2.5">
+          {used.map((cap) => (
+            <div key={`${cap.tier}:${cap.name}`} className="space-y-1">
+              <div className="flex items-center gap-1.5">
+                <span className="font-mono text-[12px] font-semibold text-primary/90">{cap.name}</span>
+                <Badge variant="outline" className="text-[9px]">
+                  {cap.tier}
+                </Badge>
+              </div>
+              {cap.methods.length > 0 && (
+                <p className="font-mono text-[10px] leading-snug text-muted-foreground/70">
+                  {cap.methods.join(' · ')}
+                </p>
+              )}
+              {cap.shadowsUser && (
+                <p className="text-[10px] leading-snug text-info">project tool, shadowing Shared tools</p>
+              )}
+              {cap.loadError && (
+                <p className="text-[10px] leading-snug text-destructive">{cap.loadError}</p>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  )
+}
 
 export function RunConfig() {
   const agents = useStore((s) => s.agents)
@@ -117,6 +250,10 @@ export function RunConfig() {
         </Label>
         <Switch id="manual" checked={manualApprovals} onCheckedChange={setManualApprovals} />
       </div>
+
+      <SecretsPanel />
+
+      <CapabilitiesPanel />
 
       <MethodConfig />
     </div>

@@ -19,6 +19,27 @@ export type AgentCallStatus =
 
 export type ToolCallStatus = 'pending' | 'in_progress' | 'completed' | 'failed'
 
+export type EffectCallStatus = 'running' | 'ok' | 'error'
+
+/** One capability effect (<ns>.<method>()) invocation within a run. */
+export interface EffectCallState {
+  id: string
+  callIndex: number
+  capability: string
+  method: string
+  phase: string
+  /** 1-based source line of the <ns>.<method>() call, when known. */
+  line?: number
+  /** JSON-serializable args as passed (snapshotted; redacted of nothing — secrets never flow here). */
+  args: unknown
+  /** JSON-serializable result (present when status==='ok'). */
+  result?: unknown
+  error?: string
+  status: EffectCallStatus
+  startedAt?: number
+  finishedAt?: number
+}
+
 export interface ToolCallState {
   id: string
   title: string
@@ -69,6 +90,8 @@ export interface PhaseState {
   detail?: string
   /** IDs of agent calls grouped under this phase. */
   agentIds: string[]
+  /** IDs of effect calls grouped under this phase. Optional so existing construction sites need not change; push via `(phase.effectIds ??= []).push(id)`. */
+  effectIds?: string[]
 }
 
 export type AcpEventLevel =
@@ -142,6 +165,8 @@ export interface RunSnapshot {
   configOptions?: LiveConfigOption[]
   phases: PhaseState[]
   agents: AgentCallState[]
+  /** Capability effect calls recorded during the run (initialized [] in WorkflowRun constructor). */
+  effects: EffectCallState[]
   log: AcpLogEntry[]
   pause?: PauseInfo
   result?: unknown
@@ -162,6 +187,15 @@ export type RunEvent =
   | { type: 'agent:started'; agent: AgentCallState }
   | { type: 'agent:delta'; agentId: string; channel: 'message' | 'thought'; text: string }
   | { type: 'agent:tool'; agentId: string; tool: ToolCallState }
+  | { type: 'effect:started'; effect: EffectCallState }
+  | {
+      type: 'effect:finished'
+      effectId: string
+      status: 'ok' | 'error'
+      result?: unknown
+      error?: string
+      durationMs: number
+    }
   | {
       type: 'agent:finished'
       agentId: string

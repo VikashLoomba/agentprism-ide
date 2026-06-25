@@ -11,6 +11,7 @@ import type {
   AgentCallState,
   AgentCallStatus,
   AgentTokenUsage,
+  EffectCallState,
   LiveConfigOption,
   PauseInfo,
   PhaseState,
@@ -21,13 +22,27 @@ import type {
   ToolCallState,
 } from '../../shared/events.ts'
 import type { PermissionRequest, PermissionResponse, RunRequest } from '../../shared/protocol.ts'
+import type { Capability, CapabilityContext, Json } from '../../shared/capability.ts'
+import type { CapabilityCatalog } from '../../shared/capability-resolve.ts'
 import { AcpAgentConnection, type PermissionAsk } from '../acp/connection.ts'
 import type { RequestPermissionResponse, SessionConfigOption, SessionUpdate } from '@agentclientprotocol/sdk'
 import { buildSandboxGlobals, runVm, type CheckpointOptions, type MethodConfigMap, type SandboxHost } from './executor.ts'
 import { instrumentWorkflow, sourceLineFromStack } from './instrument.ts'
-import { AgentLimitError, TokenBudgetError, WorkflowAbortError, isNonRecoverable } from './errors.ts'
+import { inlineHelpers } from './inline.ts'
+import { loadCapabilities, getCapabilityModules, type LoadedCapabilities } from './capability-loader.ts'
+import { AgentLimitError, NonRecoverableWorkflowError, TokenBudgetError, WorkflowAbortError, isNonRecoverable } from './errors.ts'
 
 const shortid = customAlphabet('0123456789abcdefghijklmnopqrstuvwxyz', 8)
+
+/** Hard ceiling on recorded capability effects per run (mirrors MAX_AGENTS_PER_RUN). */
+const MAX_EFFECTS_PER_RUN = 1000
+
+/** Non-recoverable: the per-run effect ceiling was hit (propagates, never → null). */
+class EffectLimitError extends NonRecoverableWorkflowError {
+  constructor(max: number) {
+    super('EFFECT_LIMIT_EXCEEDED', `Effect limit exceeded (max ${max} per run)`)
+  }
+}
 
 type PermissionOutcome = RequestPermissionResponse['outcome']
 
@@ -135,9 +150,15 @@ export class WorkflowRun {
   private limiter: Limiter
   private headerLines = 0
   private agentCounter = 0
+  private effectCounter = 0
   private spentTokens = 0
   private tokenBudget: number | null
   private methodConfigs: MethodConfigMap = {}
+
+  /** Resolved + loaded capability namespaces for this run (declared in meta.capabilities). */
+  private capabilityModules = new Map<string, Capability>()
+  /** Run-time capability catalog (project>user), threaded into validateWorkflow. */
+  private capabilityCatalog?: CapabilityCatalog
 
   private aborted = false
   private finished = false
@@ -145,6 +166,7 @@ export class WorkflowRun {
 
   private snapshot: RunSnapshot
   private agentMap = new Map<string, AgentCallState>()
+  private effectMap = new Map<string, EffectCallState>()
   private sessionToAgent = new Map<string, string>()
   private breakpoints: Set<number>
 
@@ -171,6 +193,7 @@ export class WorkflowRun {
       cwd: this.cwd,
       phases: [],
       agents: [],
+      effects: [],
       log: [],
       stats: { agentCount: 0, completed: 0, failed: 0, durationMs: 0, tokens: {} },
       breakpoints: [...this.breakpoints],
@@ -566,6 +589,86 @@ export class WorkflowRun {
     return result
   }
 
+  /* ---------------------------- host: capabilities ------------------------ */
+
+  /** Build the trusted ctx for one capability: declared secret VALUES (never
+   *  cross into the sandbox) + a structured logger that writes to the acp log. */
+  private ctxFor(cap: Capability): CapabilityContext {
+    const secrets: Record<string, string | undefined> = {}
+    // Project overrides user at the process.env layer already (a single flat env);
+    // we expose ONLY this capability's declared names, never the whole env.
+    for (const name of cap.secrets) {
+      const val = process.env[name]
+      secrets[name] = typeof val === 'string' && val.length > 0 ? val : undefined
+    }
+    return {
+      secrets: Object.freeze(secrets),
+      // Secret VALUES live only in the closure above; the log carries author text.
+      log: (message: string, data?: Json) => this.logAcp('info', 'effect_log', `↯ ${cap.name}: ${message}`, data),
+    }
+  }
+
+  /** Bind one capability into a frozen namespace object for the vm scope.
+   *  Each effect is wrapped so the host injects ctx, records a run-tree node,
+   *  and translates recoverable failures to null. */
+  private bindCapability = (cap: Capability, ctx: CapabilityContext): Readonly<Record<string, (args: Json) => Promise<Json | null>>> => {
+    const ns: Record<string, (args: Json) => Promise<Json | null>> = {}
+    for (const method of Object.keys(cap.effects)) {
+      ns[method] = (args: Json) => this.runEffect(cap, ctx, method, args)
+    }
+    return Object.freeze(ns) // prevents sandbox monkey-patching of methods
+  }
+
+  /** The RECORDED effect — modeled 1:1 on runAgent. */
+  private runEffect = async (
+    cap: Capability,
+    ctx: CapabilityContext,
+    method: string,
+    args: Json,
+  ): Promise<Json | null> => {
+    const stack = new Error().stack // capture BEFORE any await
+    const line = sourceLineFromStack(stack, this.headerLines)
+    if (this.aborted) throw new WorkflowAbortError()
+    if (this.effectCounter >= MAX_EFFECTS_PER_RUN) throw new EffectLimitError(MAX_EFFECTS_PER_RUN)
+    this.effectCounter++
+    const callIndex = this.effectCounter
+    const id = `e${callIndex}-${shortid()}`
+    const phaseTitle = this.currentPhase || (this.snapshot.phases[0]?.title ?? 'main')
+    const state: EffectCallState = {
+      id,
+      callIndex,
+      capability: cap.name,
+      method,
+      phase: phaseTitle,
+      line,
+      args,
+      status: 'running',
+      startedAt: Date.now(),
+    }
+    this.effectMap.set(id, state)
+    this.snapshot.effects.push(state)
+    ;(this.ensurePhase(phaseTitle).effectIds ??= []).push(id)
+    this.emit({ type: 'effect:started', effect: state })
+    this.logAcp('info', 'effect_start', `↯ ${cap.name}.${method}`)
+    try {
+      const result = (await cap.effects[method](ctx, args)) as Json
+      state.result = result
+      state.status = 'ok'
+      state.finishedAt = Date.now()
+      this.emit({ type: 'effect:finished', effectId: id, status: 'ok', result, durationMs: state.finishedAt - state.startedAt! })
+      this.logAcp('info', 'effect_done', `↯ ${cap.name}.${method} ✓`)
+      return result
+    } catch (err) {
+      if (isNonRecoverable(err)) throw err // abort/limit propagate
+      state.status = 'error'
+      state.error = err instanceof Error ? err.message : String(err)
+      state.finishedAt = Date.now()
+      this.emit({ type: 'effect:finished', effectId: id, status: 'error', error: state.error, durationMs: state.finishedAt - state.startedAt! })
+      this.logAcp('warn', 'effect_fail', `↯ ${cap.name}.${method} failed: ${state.error}`)
+      return null // recoverable => null (like runAgent)
+    }
+  }
+
   /* --------------------------- host: phase/log ---------------------------- */
 
   private phaseFn = (title: string): void => {
@@ -590,9 +693,10 @@ export class WorkflowRun {
     if (typeof script !== 'string' || !/export\s+const\s+meta/.test(script)) {
       throw new Error('workflow(): only inline workflow scripts are supported (pass a script string starting with `export const meta`).')
     }
-    const v = validateWorkflow(script, this.request.agent)
+    const v = validateWorkflow(script, this.request.agent, undefined, this.capabilityCatalog)
     if (!v.ok) throw new Error('Nested workflow failed validation: ' + v.diagnostics.map((d) => d.message).join('; '))
-    const { code } = instrumentWorkflow(v.normalized)
+    const { source, headerBindings } = inlineHelpers(v.normalized)
+    const { code } = instrumentWorkflow(source, headerBindings)
     const globals = buildSandboxGlobals(this.hostHooks(args), this.resolveConfigs(v.meta, false))
     return runVm(code, globals)
   }
@@ -627,6 +731,9 @@ export class WorkflowRun {
       },
       args: argsOverride !== undefined ? argsOverride : this.request.args,
       cwd: this.cwd,
+      capabilities: Object.fromEntries(
+        [...this.capabilityModules].map(([ns, cap]) => [ns, this.bindCapability(cap, this.ctxFor(cap))]),
+      ),
     }
   }
 
@@ -658,7 +765,18 @@ export class WorkflowRun {
   }
 
   async start(): Promise<void> {
-    const validation = validateWorkflow(this.request.source, this.request.agent)
+    // Load the trusted capability catalog/modules once for this run. Best-effort:
+    // a loader failure leaves the catalog undefined so validateWorkflow skips
+    // capability resolution gracefully rather than crashing the run.
+    let loaded: LoadedCapabilities | undefined
+    try {
+      loaded = await loadCapabilities(process.env)
+      this.capabilityCatalog = loaded.catalog
+    } catch (err) {
+      this.logAcp('warn', 'capabilities', `Failed to load capabilities: ${err instanceof Error ? err.message : String(err)}`)
+    }
+
+    const validation = validateWorkflow(this.request.source, this.request.agent, undefined, this.capabilityCatalog)
     if (!validation.ok || !validation.meta) {
       const msg = validation.diagnostics.find((d) => d.severity === 'error')?.message ?? 'Invalid workflow'
       this.snapshot.error = msg
@@ -669,6 +787,11 @@ export class WorkflowRun {
     }
     const meta = validation.meta
     this.snapshot.meta = meta
+    // Resolve the workflow's declared capability namespaces (project>user) to the
+    // already-loaded modules so hostHooks() injects only declared+resolved globals.
+    if (loaded && meta.capabilities?.length) {
+      this.capabilityModules = getCapabilityModules(loaded, meta.capabilities)
+    }
     for (const d of validation.diagnostics) {
       if (d.severity === 'warning') this.logAcp('warn', 'validate', d.message)
     }
@@ -705,9 +828,12 @@ export class WorkflowRun {
       return
     }
 
-    const { code, headerLines } = instrumentWorkflow(validation.normalized)
-    this.headerLines = headerLines
     try {
+      // Inline pure tools/ helpers into the header, THEN instrument; headerLines is
+      // computed from the emitted prefix so the source-line mapping stays correct.
+      const { source, headerBindings } = inlineHelpers(validation.normalized)
+      const { code, headerLines } = instrumentWorkflow(source, headerBindings)
+      this.headerLines = headerLines
       const result = await runVm(code, buildSandboxGlobals(this.hostHooks(), this.methodConfigs))
       if (this.aborted) this.finishRun('cancelled')
       else this.finishRun('completed', undefined, result)

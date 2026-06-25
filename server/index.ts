@@ -8,9 +8,10 @@ import { z } from 'zod'
 import { ACP_AGENT_LIST } from '../shared/agents.ts'
 import type { AcpAgentSpec } from '../shared/agents.ts'
 import { validateWorkflow } from '../shared/validate.ts'
-import type { AgentsResponse, ClientMessage, ServerMessage } from '../shared/protocol.ts'
+import type { AgentsResponse, CapabilitiesResponse, ClientMessage, ServerMessage } from '../shared/protocol.ts'
 import { PORT, DEFAULT_CWD, AGENT_BINS } from './config.ts'
 import { listWorkflows, readWorkflow, writeWorkflow, deleteWorkflow } from './store/workflows.ts'
+import { loadCapabilities } from './workflow/capability-loader.ts'
 import { RunManager } from './run-manager.ts'
 
 function isInstalled(agentId: string): boolean {
@@ -77,13 +78,29 @@ app.delete('/api/workflows/:name', async (req, res, next) => {
   }
 })
 
-const validateSchema = z.object({ source: z.string() })
-app.post('/api/validate', (req, res) => {
+app.get('/api/capabilities', async (_req, res, next) => {
   try {
-    const { source } = validateSchema.parse(req.body)
-    res.json(validateWorkflow(source))
+    const { entries } = await loadCapabilities(process.env)
+    const body: CapabilitiesResponse = { capabilities: entries }
+    res.json(body)
+  } catch (err) {
+    next(err)
+  }
+})
+
+const validateSchema = z.object({ source: z.string() })
+app.post('/api/validate', async (req, res, next) => {
+  let source: string
+  try {
+    ;({ source } = validateSchema.parse(req.body))
   } catch {
-    res.status(400).json({ error: 'source is required' })
+    return res.status(400).json({ error: 'source is required' })
+  }
+  try {
+    const { catalog } = await loadCapabilities(process.env)
+    res.json(validateWorkflow(source, undefined, undefined, catalog))
+  } catch (err) {
+    next(err)
   }
 })
 

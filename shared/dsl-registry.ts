@@ -272,6 +272,26 @@ declare const budget: { total: number | null; spent(): number; remaining(): numb
 
 export const DSL_METHOD_MAP = new Map(DSL_METHODS.map((m) => [m.name, m]))
 
+/**
+ * Names a capability namespace must NOT take, because they would collide with a
+ * DSL global (every injected `name` above) or a core JS global. A capability so
+ * named would emit a second top-level ambient `declare` and silently void DSL
+ * intellisense (semantic validation is off in monaco-setup.ts). Enforced by the
+ * dts builder (src/lib/workflow-dts.ts) and the executor injection guard.
+ */
+export const CAPABILITY_RESERVED_NAMES: ReadonlySet<string> = new Set<string>([
+  ...DSL_METHODS.map((m) => m.name),
+  'Math',
+  'JSON',
+  'Date',
+  'Promise',
+  'Object',
+  'Array',
+  'globalThis',
+  'process',
+  'console',
+])
+
 /** Names of globals that ultimately spawn agents (validator "agent() required" hint). */
 export const AGENT_PRODUCER_NAMES: ReadonlySet<string> = new Set(
   DSL_METHODS.filter((m) => m.producesAgents).map((m) => m.name),

@@ -18,8 +18,10 @@ import type { WorkflowMeta } from './dsl.ts'
 import { ACP_AGENTS } from './agents.ts'
 import type { AcpAgentId } from './agents.ts'
 import { AGENT_PRODUCER_NAMES, DSL_METHOD_MAP, validateMethodConfig } from './dsl-registry.ts'
+import { resolveCapability } from './capability-resolve.ts'
+import type { CapabilityCatalog } from './capability-resolve.ts'
 
-export type DiagnosticSeverity = 'error' | 'warning'
+export type DiagnosticSeverity = 'error' | 'warning' | 'info'
 
 export interface Diagnostic {
   message: string
@@ -175,6 +177,18 @@ function validateMeta(meta: unknown): string[] {
       }
     }
   }
+  if (m.capabilities !== undefined) {
+    if (!Array.isArray(m.capabilities)) {
+      errors.push('meta.capabilities must be an array of strings')
+    } else {
+      for (const cap of m.capabilities) {
+        if (typeof cap !== 'string' || cap.trim() === '') {
+          errors.push('each meta.capabilities entry must be a non-empty string')
+          break
+        }
+      }
+    }
+  }
   if (m.config !== undefined) {
     if (typeof m.config !== 'object' || m.config === null || Array.isArray(m.config)) {
       errors.push('meta.config must be an object keyed by method name (e.g. { verify: { reviewers: 3 } })')
@@ -204,6 +218,7 @@ export function validateWorkflow(
   rawSource: string,
   selectedAgentId?: AcpAgentId,
   connectedAgentIds?: AcpAgentId[],
+  capabilityCatalog?: CapabilityCatalog,
 ): ValidateResult {
   const normalized = normalizeScript(rawSource)
   const diagnostics: Diagnostic[] = []
@@ -288,6 +303,44 @@ export function validateWorkflow(
           for (const message of metaErrors) diagnostics.push(diagAt(init, message))
         } else {
           meta = value as WorkflowMeta
+          // Resolve declared capabilities against the (optional) threaded
+          // catalog. Done here, not in validateMeta, because it needs the AST
+          // element locations and the catalog. Skipped entirely when no catalog
+          // is supplied (graceful degradation).
+          if (capabilityCatalog) {
+            const metaObj = init as unknown as { type: string; properties?: Node[] }
+            if (metaObj.type === 'ObjectExpression' && Array.isArray(metaObj.properties)) {
+              for (const prop of metaObj.properties) {
+                const p = prop as unknown as {
+                  type: string
+                  key?: { type: string; name?: string; value?: unknown }
+                  value?: Node & { type?: string; elements?: Array<Node | null> }
+                }
+                if (p.type !== 'Property' || !p.key) continue
+                const keyName =
+                  p.key.type === 'Identifier'
+                    ? p.key.name
+                    : p.key.type === 'Literal' && typeof p.key.value === 'string'
+                      ? p.key.value
+                      : null
+                if (keyName !== 'capabilities') continue
+                if (!p.value || p.value.type !== 'ArrayExpression' || !Array.isArray(p.value.elements)) continue
+                for (const el of p.value.elements) {
+                  if (!el) continue
+                  const elNode = el as unknown as { type: string; value?: unknown }
+                  if (elNode.type !== 'Literal' || typeof elNode.value !== 'string') continue
+                  const res = resolveCapability(capabilityCatalog, elNode.value)
+                  if (res.resolved === null) {
+                    diagnostics.push(diagAt(el, `capability "${res.bareName}" does not resolve`, 'error'))
+                  } else if (res.shadowsUser) {
+                    diagnostics.push(
+                      diagAt(el, `${res.bareName} -> ./tools, shadowing Shared tools`, 'info'),
+                    )
+                  }
+                }
+              }
+            }
+          }
         }
       } catch (err) {
         if (err instanceof LiteralError) diagnostics.push(diagAt(err.node, err.message))

@@ -1,6 +1,7 @@
 import { useEffect } from 'react'
-import { FilePlus2, RefreshCw, Trash2, FileCode2 } from 'lucide-react'
+import { FilePlus2, RefreshCw, Trash2, FileCode2, Wrench, Share2, AlertTriangle } from 'lucide-react'
 import { toast } from 'sonner'
+import type { CapabilityCatalogEntry } from '@shared/protocol'
 import { useStore } from '@/store/useStore'
 import { Button } from '@/components/ui/button'
 import { ScrollArea } from '@/components/ui/scroll-area'
@@ -13,6 +14,8 @@ export function FileSidebar() {
   const openFile = useStore((s) => s.openFile)
   const newFile = useStore((s) => s.newFile)
   const deleteFileByName = useStore((s) => s.deleteFileByName)
+  const capabilities = useStore((s) => s.capabilities)
+  const usedCapabilities = useStore((s) => s.validation.meta?.capabilities)
 
   useEffect(() => {
     refreshFiles()
@@ -36,6 +39,38 @@ export function FileSidebar() {
       toast.error(err instanceof Error ? err.message : 'Delete failed')
     }
   }
+
+  // Tool files are world-touching capabilities loaded host-side; they are opened
+  // read-only by their absolute source path (never editable in the IDE here).
+  async function handleOpenTool(cap: CapabilityCatalogEntry) {
+    if (cap.loadError) {
+      toast.error(`${cap.name}: ${cap.loadError}`)
+      return
+    }
+    try {
+      const res = await fetch(`/api/file?path=${encodeURIComponent(cap.path)}`)
+      if (!res.ok) throw new Error(`${res.status} ${res.statusText}`)
+      const { content } = (await res.json()) as { content: string }
+      useStore.getState().setSource(content)
+      toast.info(`Opened ${cap.name} (read-only — edit on disk at ${cap.path})`)
+    } catch {
+      toast.error(`Could not open ${cap.name}. Edit it on disk: ${cap.path}`)
+    }
+  }
+
+  const projectTools = capabilities.filter((c) => c.tier === 'project')
+  const userTools = capabilities.filter((c) => c.tier === 'user')
+
+  // Non-portable hint: the active workflow leans on a user-tier (Shared tools)
+  // capability, so it won't run unchanged for someone without that mount.
+  const usesUserTier =
+    !!usedCapabilities &&
+    userTools.some(
+      (u) =>
+        usedCapabilities.includes(u.name) ||
+        usedCapabilities.includes(`user:${u.name}`) ||
+        usedCapabilities.includes(`@me/${u.name}`),
+    )
 
   return (
     <div className="flex h-full flex-col">
@@ -75,7 +110,71 @@ export function FileSidebar() {
             </button>
           ))}
         </div>
+
+        {projectTools.length > 0 && (
+          <ToolSection
+            label="Tools"
+            icon={<Wrench className="size-3.5 shrink-0 text-primary/80" />}
+            tools={projectTools}
+            onOpen={handleOpenTool}
+          />
+        )}
+
+        {userTools.length > 0 && (
+          <ToolSection
+            label="Shared tools"
+            icon={<Share2 className="size-3.5 shrink-0 text-primary/80" />}
+            tools={userTools}
+            onOpen={handleOpenTool}
+            hint={
+              usesUserTier
+                ? 'This workflow uses a Shared tool — it is not portable without that mount.'
+                : undefined
+            }
+          />
+        )}
       </ScrollArea>
+    </div>
+  )
+}
+
+function ToolSection({
+  label,
+  icon,
+  tools,
+  onOpen,
+  hint,
+}: {
+  label: string
+  icon: React.ReactNode
+  tools: CapabilityCatalogEntry[]
+  onOpen: (cap: CapabilityCatalogEntry) => void
+  hint?: string
+}) {
+  return (
+    <div className="border-t border-border/50">
+      <div className="px-3 py-2">
+        <span className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">{label}</span>
+      </div>
+      <div className="px-2 pb-2">
+        {tools.map((cap) => (
+          <button
+            key={`${cap.tier}:${cap.name}`}
+            onClick={() => onOpen(cap)}
+            title={cap.loadError ? cap.loadError : cap.path}
+            className="group flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-[13px] transition-colors hover:bg-accent/50"
+          >
+            {icon}
+            <span className="min-w-0 flex-1 truncate">{cap.name}</span>
+            {cap.loadError && (
+              <AlertTriangle className="size-3.5 shrink-0 text-amber-500" />
+            )}
+          </button>
+        ))}
+        {hint && (
+          <p className="px-2 pt-1 text-[11px] leading-snug text-amber-600 dark:text-amber-500">{hint}</p>
+        )}
+      </div>
     </div>
   )
 }

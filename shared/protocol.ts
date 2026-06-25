@@ -92,3 +92,27 @@ export interface AgentsResponse {
   /** Default working directory suggested for new runs. */
   defaultCwd: string
 }
+
+/** Safe metadata view of one capability (NEVER the effect fns, NEVER secret values). */
+export interface CapabilityCatalogEntry {
+  /** Namespace name (== Capability.name). */
+  name: string
+  tier: 'project' | 'user'
+  /** Declared secret NAMES only. */
+  secrets: string[]
+  /** Per-secret presence from host env (host computes; UI shows required/present). */
+  secretStatus: Record<string, { present: boolean }>
+  /** Effect method names (for the palette / hovers). */
+  methods: string[]
+  /** Hand-written ambient `declare const <name>: { ... }` body, or '' for loose. */
+  dts: string
+  /** Absolute source path (for "open in editor"). */
+  path: string
+  modifiedAt: number
+  /** Populated when the module failed to import/validate (one bad module ≠ broken catalog). */
+  loadError?: string
+}
+
+export interface CapabilitiesResponse {
+  capabilities: CapabilityCatalogEntry[]   // both tiers, tier-tagged
+}

@@ -45,6 +45,15 @@ export interface WorkflowMeta {
    * per-run on top of whatever the script declares here.
    */
   config?: Record<string, Record<string, unknown>>
+  /**
+   * Declared capability (Shared tools) namespaces this workflow may call.
+   * Each entry is a bare name resolved project-local `tools/` first, then
+   * user-level `~/.agentprism/tools/`. A name may be tier-qualified with a
+   * `project:`, `user:`, or `@me/` prefix to force a specific tier (`@me/foo`
+   * and `user:foo` both pin the user tier; `project:foo` pins the project
+   * tier). Unresolved names are a hard validation error.
+   */
+  capabilities?: string[]
 }
 
 export interface AgentOptions {

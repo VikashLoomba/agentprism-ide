@@ -1,5 +1,6 @@
 import vm from 'node:vm'
 import type { AgentOptions } from '../../shared/dsl.ts'
+import type { Json } from '../../shared/capability.ts'
 import { DSL_METHODS, methodDefaults } from '../../shared/dsl-registry.ts'
 import { instrumentWorkflow, WORKFLOW_FILENAME } from './instrument.ts'
 import { isNonRecoverable } from './errors.ts'
@@ -23,6 +24,9 @@ export interface SandboxHost {
   budget: { total: number | null; spent: () => number; remaining: () => number }
   args: unknown
   cwd: string
+  /** Namespace -> { method: (args)=>Promise<result> }. Each namespace object is
+   *  ALREADY frozen + host-bound + recorded by WorkflowRun.bindCapability. */
+  capabilities: Record<string, Readonly<Record<string, (args: Json) => Promise<Json | null>>>>
 }
 
 /** Per-method resolved config, keyed by method name. */
@@ -102,6 +106,14 @@ export function buildSandboxGlobals(host: SandboxHost, config: MethodConfigMap =
   for (const d of DSL_METHODS) {
     if (d.kind === 'primitive') scope[d.name] = bindPrimitive(d.name, host)
     else if (d.kind === 'value') scope[d.name] = bindValue(d.name, host)
+  }
+
+  // 1b. Capability namespaces from the host (already frozen + recorded).
+  //     Injected AFTER the primitive/value loop, guarded against collisions
+  //     with DSL globals. bindPrimitive/bindValue are untouched.
+  for (const [ns, obj] of Object.entries(host.capabilities)) {
+    if (ns in scope) throw new Error(`capability namespace "${ns}" collides with a DSL global`)
+    scope[ns] = obj // live host reference; vm.createContext contextifies in place
   }
 
   // 2. Combinators built on top of the scope. Factories read OTHER globals
