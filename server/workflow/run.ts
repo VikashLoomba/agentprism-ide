@@ -1,0 +1,742 @@
+import { customAlphabet } from 'nanoid'
+import { ACP_AGENTS } from '../../shared/agents.ts'
+import type { AcpAgentId, SessionModeState } from '../../shared/agents.ts'
+import { MAX_AGENTS_PER_RUN, MAX_CONCURRENCY } from '../../shared/dsl.ts'
+import type { AgentOptions, WorkflowMeta } from '../../shared/dsl.ts'
+import { DSL_METHODS, resolveMethodConfig, validateMethodConfig } from '../../shared/dsl-registry.ts'
+import { validateWorkflow } from '../../shared/validate.ts'
+import type {
+  AcpEventLevel,
+  AcpLogEntry,
+  AgentCallState,
+  AgentCallStatus,
+  AgentTokenUsage,
+  LiveConfigOption,
+  PauseInfo,
+  PhaseState,
+  RunEvent,
+  RunSnapshot,
+  RunStats,
+  RunStatus,
+  ToolCallState,
+} from '../../shared/events.ts'
+import type { PermissionRequest, PermissionResponse, RunRequest } from '../../shared/protocol.ts'
+import { AcpAgentConnection, type PermissionAsk } from '../acp/connection.ts'
+import type { RequestPermissionResponse, SessionConfigOption, SessionUpdate } from '@agentclientprotocol/sdk'
+import { buildSandboxGlobals, runVm, type CheckpointOptions, type MethodConfigMap, type SandboxHost } from './executor.ts'
+import { instrumentWorkflow, sourceLineFromStack } from './instrument.ts'
+import { AgentLimitError, TokenBudgetError, WorkflowAbortError, isNonRecoverable } from './errors.ts'
+
+const shortid = customAlphabet('0123456789abcdefghijklmnopqrstuvwxyz', 8)
+
+type PermissionOutcome = RequestPermissionResponse['outcome']
+
+export interface RunCallbacks {
+  emit: (event: RunEvent) => void
+  notifyPermission: (req: PermissionRequest) => void
+}
+
+interface PauseRecord {
+  info: PauseInfo
+  resolve: () => void
+  reject: (err: unknown) => void
+}
+
+interface Releaser {
+  (): void
+}
+
+/** FIFO concurrency limiter (mirrors pi's createLimiter). */
+class Limiter {
+  private active = 0
+  private queue: Array<() => void> = []
+  constructor(private max: number) {}
+  async acquire(): Promise<Releaser> {
+    while (this.active >= this.max) {
+      await new Promise<void>((res) => this.queue.push(res))
+    }
+    this.active++
+    let released = false
+    return () => {
+      if (released) return
+      released = true
+      this.active--
+      const next = this.queue.shift()
+      if (next) next()
+    }
+  }
+}
+
+function defaultLabel(prompt: string): string {
+  const words = prompt.trim().split(/\s+/).slice(0, 6).join(' ')
+  return words.length > 48 ? words.slice(0, 45) + '…' : words || 'agent'
+}
+
+function asText(value: unknown): string {
+  if (typeof value === 'string') return value
+  try {
+    return JSON.stringify(value)
+  } catch {
+    return String(value)
+  }
+}
+
+/** Best-effort JSON extraction from an agent's free-text reply. */
+function parseStructured(text: string): unknown {
+  const stripped = text.replace(/^```[a-zA-Z]*\s*\n?/, '').replace(/\n?```$/, '').trim()
+  for (const candidate of [stripped, text.trim()]) {
+    try {
+      return JSON.parse(candidate)
+    } catch {
+      /* try extraction */
+    }
+    const start = candidate.search(/[[{]/)
+    if (start >= 0) {
+      const open = candidate[start]
+      const close = open === '{' ? '}' : ']'
+      let depth = 0
+      let inStr = false
+      let esc = false
+      for (let i = start; i < candidate.length; i++) {
+        const ch = candidate[i]
+        if (inStr) {
+          if (esc) esc = false
+          else if (ch === '\\') esc = true
+          else if (ch === '"') inStr = false
+        } else if (ch === '"') inStr = true
+        else if (ch === open) depth++
+        else if (ch === close) {
+          depth--
+          if (depth === 0) {
+            try {
+              return JSON.parse(candidate.slice(start, i + 1))
+            } catch {
+              break
+            }
+          }
+        }
+      }
+    }
+  }
+  return undefined
+}
+
+export class WorkflowRun {
+  readonly runId: string
+  private callbacks: RunCallbacks
+  private request: RunRequest
+  private cwd: string
+  private modeId?: string
+  private autoApprove: boolean
+  private stepMode: boolean
+
+  private connections = new Map<AcpAgentId, AcpAgentConnection>()
+  private connecting = new Map<AcpAgentId, Promise<AcpAgentConnection>>()
+  private limiter: Limiter
+  private headerLines = 0
+  private agentCounter = 0
+  private spentTokens = 0
+  private tokenBudget: number | null
+  private methodConfigs: MethodConfigMap = {}
+
+  private aborted = false
+  private finished = false
+  private currentPhase = ''
+
+  private snapshot: RunSnapshot
+  private agentMap = new Map<string, AgentCallState>()
+  private sessionToAgent = new Map<string, string>()
+  private breakpoints: Set<number>
+
+  private currentPause?: PauseRecord
+  private waitingPauses: PauseRecord[] = []
+  private pendingPermissions = new Map<string, (outcome: PermissionOutcome) => void>()
+  private lastModesJson = ''
+
+  constructor(request: RunRequest, callbacks: RunCallbacks) {
+    this.runId = request.runId
+    this.request = request
+    this.callbacks = callbacks
+    this.cwd = request.cwd
+    this.modeId = request.modeId
+    this.autoApprove = !request.manualApprovals
+    this.stepMode = !!request.stepMode
+    this.tokenBudget = request.tokenBudget ?? null
+    this.breakpoints = new Set(request.breakpoints ?? [])
+    this.limiter = new Limiter(Math.min(MAX_CONCURRENCY, Math.max(1, request.maxConcurrency ?? 8)))
+    this.snapshot = {
+      runId: this.runId,
+      status: 'starting',
+      agent: request.agent,
+      cwd: this.cwd,
+      phases: [],
+      agents: [],
+      log: [],
+      stats: { agentCount: 0, completed: 0, failed: 0, durationMs: 0, tokens: {} },
+      breakpoints: [...this.breakpoints],
+      startedAt: Date.now(),
+    }
+  }
+
+  getSnapshot(): RunSnapshot {
+    return this.snapshot
+  }
+
+  isDone(): boolean {
+    return this.finished
+  }
+
+  /* ----------------------------- emit helpers ----------------------------- */
+
+  private emit(event: RunEvent): void {
+    this.callbacks.emit(event)
+  }
+
+  private setStatus(status: RunStatus): void {
+    this.snapshot.status = status
+    this.emit({ type: 'run:status', status })
+  }
+
+  private logAcp(level: AcpEventLevel, type: string, text: string, data?: unknown, agentId?: string): void {
+    const entry: AcpLogEntry = {
+      id: shortid(),
+      ts: Date.now(),
+      agentId,
+      agentLabel: agentId ? this.agentMap.get(agentId)?.label : undefined,
+      level,
+      type,
+      text,
+      data,
+    }
+    this.snapshot.log.push(entry)
+    if (this.snapshot.log.length > 3000) this.snapshot.log.splice(0, this.snapshot.log.length - 3000)
+    this.emit({ type: 'acp', entry })
+  }
+
+  private handleModes(modes: SessionModeState): void {
+    const json = JSON.stringify(modes)
+    if (json === this.lastModesJson) return
+    this.lastModesJson = json
+    this.snapshot.modes = modes
+    this.emit({ type: 'session:modes', modes })
+  }
+
+  private emitConfigOptions(agentId: string, sdk: SessionConfigOption[]): void {
+    const mapped: LiveConfigOption[] = sdk.map((o) => ({
+      id: o.id,
+      name: o.name,
+      type: o.type,
+      currentValue: o.currentValue,
+      values:
+        o.type === 'select' && 'options' in o && Array.isArray((o as any).options)
+          ? (o as any).options.map((x: any) => ({ value: x.value, name: x.name }))
+          : undefined,
+    }))
+    this.snapshot.configOptions = mapped
+    this.emit({ type: 'session:configOptions', agentId, options: mapped })
+  }
+
+  /* ------------------------------ public ops ------------------------------ */
+
+  setBreakpoints(lines: number[]): void {
+    this.breakpoints = new Set(lines)
+    this.snapshot.breakpoints = [...this.breakpoints]
+    this.emit({ type: 'breakpoint:set', lines: this.snapshot.breakpoints })
+  }
+
+  resume(): void {
+    this.stepMode = false
+    this.releasePause()
+  }
+
+  step(): void {
+    this.stepMode = true
+    this.releasePause()
+  }
+
+  private releasePause(): void {
+    const rec = this.currentPause
+    if (!rec) return
+    this.currentPause = undefined
+    this.snapshot.pause = undefined
+    this.emit({ type: 'breakpoint:resumed', pauseId: rec.info.id })
+    rec.resolve()
+    const next = this.waitingPauses.shift()
+    if (next) this.activatePause(next)
+    else if (!this.finished) this.setStatus('running')
+  }
+
+  private activatePause(rec: PauseRecord): void {
+    this.currentPause = rec
+    this.snapshot.pause = rec.info
+    this.setStatus('paused')
+    this.emit({ type: 'breakpoint:hit', pause: rec.info })
+  }
+
+  private requestPause(info: PauseInfo): Promise<void> {
+    return new Promise<void>((resolve, reject) => {
+      if (this.aborted) {
+        reject(new WorkflowAbortError())
+        return
+      }
+      const rec: PauseRecord = { info, resolve, reject }
+      if (!this.currentPause) this.activatePause(rec)
+      else this.waitingPauses.push(rec)
+    })
+  }
+
+  cancel(): void {
+    if (this.finished || this.aborted) return
+    this.aborted = true
+    this.logAcp('warn', 'cancel', 'Run cancelled by user')
+    // Wake all paused agents so they observe the abort and unwind.
+    const pauses = [this.currentPause, ...this.waitingPauses].filter(Boolean) as PauseRecord[]
+    this.currentPause = undefined
+    this.waitingPauses = []
+    this.snapshot.pause = undefined
+    for (const p of pauses) p.reject(new WorkflowAbortError())
+    // Resolve any pending permissions as cancelled.
+    for (const resolve of this.pendingPermissions.values()) resolve({ outcome: 'cancelled' })
+    this.pendingPermissions.clear()
+  }
+
+  resolvePermission(requestId: string, response: PermissionResponse): void {
+    const resolve = this.pendingPermissions.get(requestId)
+    if (!resolve) return
+    this.pendingPermissions.delete(requestId)
+    resolve(response.kind === 'cancelled' ? { outcome: 'cancelled' } : { outcome: 'selected', optionId: response.optionId })
+  }
+
+  /* ------------------------------ permissions ----------------------------- */
+
+  private async decidePermission(ask: PermissionAsk): Promise<PermissionOutcome> {
+    const agentId = this.sessionToAgent.get(ask.sessionId)
+    this.logAcp('permission', 'request', `Permission requested: ${ask.toolTitle}`, ask.options, agentId)
+    if (this.autoApprove) {
+      const opt =
+        ask.options.find((o) => o.kind === 'allow_once') ??
+        ask.options.find((o) => o.kind?.startsWith('allow')) ??
+        ask.options[0]
+      if (!opt) return { outcome: 'cancelled' }
+      this.logAcp('permission', 'auto', `Auto-approved: ${opt.name}`, undefined, agentId)
+      return { outcome: 'selected', optionId: opt.optionId }
+    }
+    const requestId = shortid()
+    return new Promise<PermissionOutcome>((resolve) => {
+      this.pendingPermissions.set(requestId, resolve)
+      this.callbacks.notifyPermission({
+        requestId,
+        agentId: agentId ?? '',
+        agentLabel: agentId ? this.agentMap.get(agentId)?.label : undefined,
+        toolTitle: ask.toolTitle,
+        toolKind: ask.toolKind,
+        options: ask.options,
+      })
+    })
+  }
+
+  /* -------------------------- agent state helpers ------------------------- */
+
+  private ensurePhase(title: string): PhaseState {
+    let phase = this.snapshot.phases.find((p) => p.title === title)
+    if (!phase) {
+      phase = { title, agentIds: [] }
+      this.snapshot.phases.push(phase)
+    }
+    return phase
+  }
+
+  private finishAgent(state: AgentCallState, status: AgentCallStatus, error?: string): void {
+    state.status = status
+    state.finishedAt = Date.now()
+    if (error) state.error = error
+    this.emit({
+      type: 'agent:finished',
+      agentId: state.id,
+      status,
+      output: state.output,
+      resultJson: state.resultJson,
+      error,
+      tokens: state.tokens,
+    })
+    const label = state.label
+    if (status === 'completed') this.logAcp('info', 'agent_done', `✓ ${label}`, undefined, state.id)
+    else if (status === 'failed') this.logAcp('error', 'agent_fail', `✗ ${label}: ${error ?? 'failed'}`, undefined, state.id)
+  }
+
+  private handleAgentUpdate(agentId: string, update: SessionUpdate): void {
+    const state = this.agentMap.get(agentId)
+    if (!state) return
+    switch (update.sessionUpdate) {
+      case 'agent_message_chunk':
+        if (update.content.type === 'text') {
+          state.message += update.content.text
+          this.emit({ type: 'agent:delta', agentId, channel: 'message', text: update.content.text })
+        }
+        break
+      case 'agent_thought_chunk':
+        if (update.content.type === 'text') {
+          state.thoughts += update.content.text
+          this.emit({ type: 'agent:delta', agentId, channel: 'thought', text: update.content.text })
+        }
+        break
+      case 'tool_call': {
+        const tool: ToolCallState = {
+          id: update.toolCallId,
+          title: update.title,
+          kind: update.kind ?? undefined,
+          status: update.status ?? 'pending',
+          locations: update.locations?.map((l) => l.path),
+        }
+        state.toolCalls.push(tool)
+        this.emit({ type: 'agent:tool', agentId, tool })
+        this.logAcp('tool', 'tool_call', `▶ ${tool.title}`, undefined, agentId)
+        break
+      }
+      case 'tool_call_update': {
+        const tool = state.toolCalls.find((t) => t.id === update.toolCallId)
+        if (tool) {
+          if (update.status) tool.status = update.status
+          if (update.title) tool.title = update.title
+          if (update.kind) tool.kind = update.kind
+          this.emit({ type: 'agent:tool', agentId, tool })
+          if (update.status) this.logAcp('tool', 'tool_update', `${tool.title} → ${update.status}`, undefined, agentId)
+        }
+        break
+      }
+      case 'plan':
+        this.logAcp(
+          'plan',
+          'plan',
+          'Plan: ' + update.entries.map((e) => `[${e.status}] ${e.content}`).join(' | '),
+          update.entries,
+          agentId,
+        )
+        break
+      case 'current_mode_update':
+        this.logAcp('info', 'mode', `Mode → ${update.currentModeId}`, undefined, agentId)
+        break
+      case 'available_commands_update':
+        this.logAcp('info', 'commands', `${update.availableCommands.length} slash commands available`, undefined, agentId)
+        break
+      default:
+        break
+    }
+  }
+
+  /* ------------------------------ host: agent ----------------------------- */
+
+  private buildPrompt(prompt: string, opts: AgentOptions): string {
+    let out = ''
+    if (opts.label) out += `Task: ${opts.label}\n\n`
+    out += prompt
+    if (opts.schema) {
+      out +=
+        '\n\n---\nIMPORTANT: Reply with ONLY a single JSON value conforming to this JSON Schema. ' +
+        'No prose, no markdown fences.\nJSON Schema:\n' +
+        JSON.stringify(opts.schema)
+    }
+    return out
+  }
+
+  private runAgent = async (prompt: string, opts: AgentOptions = {}): Promise<unknown> => {
+    const stack = new Error().stack
+    const line = sourceLineFromStack(stack, this.headerLines)
+    if (this.aborted) throw new WorkflowAbortError()
+    if (this.agentCounter >= MAX_AGENTS_PER_RUN) throw new AgentLimitError(MAX_AGENTS_PER_RUN)
+    this.agentCounter++
+    if (this.tokenBudget != null && this.spentTokens >= this.tokenBudget) throw new TokenBudgetError()
+    const callIndex = this.agentCounter
+    const id = `a${callIndex}-${shortid()}`
+    const agentId: AcpAgentId = opts.agent ?? this.request.agent
+    const phaseTitle = opts.phase || this.currentPhase || (this.snapshot.phases[0]?.title ?? 'main')
+    const state: AgentCallState = {
+      id,
+      callIndex,
+      agent: agentId,
+      label: opts.label || defaultLabel(prompt),
+      phase: phaseTitle,
+      prompt,
+      line,
+      config: opts.config,
+      structured: !!opts.schema,
+      status: 'running',
+      message: '',
+      thoughts: '',
+      toolCalls: [],
+      startedAt: Date.now(),
+    }
+    this.agentMap.set(id, state)
+    this.snapshot.agents.push(state)
+    this.ensurePhase(phaseTitle).agentIds.push(id)
+    this.emit({ type: 'agent:started', agent: state })
+    this.logAcp('info', 'agent_start', `● ${state.label}`, undefined, id)
+    if (opts.config && Object.keys(opts.config).length) {
+      this.logAcp(
+        'info',
+        'config',
+        `config (${agentId}): ` + Object.entries(opts.config).map(([k, v]) => `${k}=${v}`).join(' '),
+        undefined,
+        id,
+      )
+    }
+
+    let result: unknown = null
+    const release = await this.limiter.acquire()
+    try {
+      if (this.aborted) throw new WorkflowAbortError()
+      const isDefaultBackend = agentId === this.request.agent
+      const conn = await this.getConnection(agentId)
+      const turn = await conn.runPrompt({
+        cwd: this.cwd,
+        // The run-wide mode selector only governs the DEFAULT backend; a
+        // non-default backend's mode comes purely from opts.config.mode.
+        modeId: isDefaultBackend ? this.modeId : undefined,
+        prompt: this.buildPrompt(prompt, opts),
+        config: opts.config,
+        signal: undefined,
+        onSession: (sid) => this.sessionToAgent.set(sid, id),
+        // Only the default backend updates the single shared mode picker so two
+        // backends don't fight over snapshot.modes.
+        onModes: (modes) => {
+          if (isDefaultBackend) this.handleModes(modes)
+        },
+        onConfigOptions: (o) => this.emitConfigOptions(id, o),
+        onUpdate: (u) => this.handleAgentUpdate(id, u),
+      })
+      if (turn.usage?.total) {
+        this.spentTokens += turn.usage.total
+        state.tokens = turn.usage
+      }
+      if (turn.stopReason === 'cancelled') throw new WorkflowAbortError()
+
+      if (opts.schema) {
+        const parsed = parseStructured(turn.text)
+        if (parsed === undefined) {
+          this.finishAgent(state, 'failed', 'Agent did not return JSON matching the requested schema')
+          result = null
+        } else {
+          state.resultJson = parsed
+          state.output = turn.text.trim()
+          result = parsed
+          this.finishAgent(state, 'completed')
+        }
+      } else {
+        const text = turn.text.trim()
+        if (!text) {
+          this.finishAgent(state, 'failed', `Empty output (stopReason=${turn.stopReason})`)
+          result = null
+        } else {
+          state.output = text
+          result = text
+          this.finishAgent(state, 'completed')
+        }
+      }
+    } catch (err) {
+      if (err instanceof WorkflowAbortError) {
+        this.finishAgent(state, 'skipped', 'aborted')
+        release()
+        throw err
+      }
+      if (isNonRecoverable(err)) {
+        this.finishAgent(state, 'failed', err.message)
+        release()
+        throw err
+      }
+      this.finishAgent(state, 'failed', err instanceof Error ? err.message : String(err))
+      result = null
+    } finally {
+      release()
+    }
+
+    // Breakpoint: pause AFTER the agent so its output can be inspected.
+    if (!this.aborted && line != null && (this.breakpoints.has(line) || this.stepMode)) {
+      await this.requestPause({
+        id: shortid(),
+        line,
+        kind: 'after-agent',
+        phase: phaseTitle,
+        agentId: id,
+        label: state.label,
+        prompt,
+        output: state.output,
+        resultJson: state.resultJson,
+      })
+    }
+    return result
+  }
+
+  /* --------------------------- host: phase/log ---------------------------- */
+
+  private phaseFn = (title: string): void => {
+    this.currentPhase = title
+    this.ensurePhase(title)
+    this.emit({ type: 'phase:enter', title })
+    this.logAcp('info', 'phase', `— Phase: ${title} —`)
+  }
+
+  private logFn = (message?: unknown): void => {
+    this.logAcp('info', 'log', asText(message ?? ''))
+  }
+
+  private checkpointFn = async (promptText: string, opts: CheckpointOptions = {}): Promise<unknown> => {
+    if (this.aborted) throw new WorkflowAbortError()
+    const value = opts.default ?? true
+    this.logAcp('info', 'checkpoint', `Checkpoint: ${promptText} → ${asText(value)} (auto)`)
+    return value
+  }
+
+  private runNested = async (script: string, args: unknown): Promise<unknown> => {
+    if (typeof script !== 'string' || !/export\s+const\s+meta/.test(script)) {
+      throw new Error('workflow(): only inline workflow scripts are supported (pass a script string starting with `export const meta`).')
+    }
+    const v = validateWorkflow(script, this.request.agent)
+    if (!v.ok) throw new Error('Nested workflow failed validation: ' + v.diagnostics.map((d) => d.message).join('; '))
+    const { code } = instrumentWorkflow(v.normalized)
+    const globals = buildSandboxGlobals(this.hostHooks(args), this.resolveConfigs(v.meta, false))
+    return runVm(code, globals)
+  }
+
+  /**
+   * Resolve every configurable method's tunables: the script's `meta.config`
+   * layered under the per-run UI overrides (request.methodConfig wins), parsed
+   * through each method's Zod schema so defaults fill the gaps.
+   */
+  private resolveConfigs(meta: WorkflowMeta | undefined, includeRequestOverrides = true): MethodConfigMap {
+    const out: MethodConfigMap = {}
+    for (const d of DSL_METHODS) {
+      if (!d.configSchema) continue
+      out[d.name] = includeRequestOverrides
+        ? resolveMethodConfig(d.name, meta?.config?.[d.name], this.request.methodConfig?.[d.name])
+        : resolveMethodConfig(d.name, meta?.config?.[d.name])
+    }
+    return out
+  }
+
+  private hostHooks(argsOverride?: unknown): SandboxHost {
+    return {
+      agent: this.runAgent,
+      phase: this.phaseFn,
+      log: this.logFn,
+      checkpoint: this.checkpointFn,
+      runNested: this.runNested,
+      budget: {
+        total: this.tokenBudget,
+        spent: () => this.spentTokens,
+        remaining: () => (this.tokenBudget == null ? Infinity : Math.max(0, this.tokenBudget - this.spentTokens)),
+      },
+      args: argsOverride !== undefined ? argsOverride : this.request.args,
+      cwd: this.cwd,
+    }
+  }
+
+  /* -------------------------------- lifecycle ----------------------------- */
+
+  /**
+   * Lazily spawn + start the ACP connection for one backend. Concurrent calls
+   * to the same backend share the single in-flight promise so we never spawn a
+   * subprocess twice. One run can drive Claude AND Codex concurrently.
+   */
+  private getConnection(agentId: AcpAgentId): Promise<AcpAgentConnection> {
+    const existing = this.connections.get(agentId)
+    if (existing) return Promise.resolve(existing)
+    let p = this.connecting.get(agentId)
+    if (!p) {
+      p = (async () => {
+        const spec = ACP_AGENTS[agentId]
+        const conn = new AcpAgentConnection(spec, {
+          log: (level, type, text, data) => this.logAcp(level as AcpEventLevel, type, text, data),
+          decidePermission: (ask) => this.decidePermission(ask),
+        })
+        await conn.start()
+        this.connections.set(agentId, conn)
+        return conn
+      })()
+      this.connecting.set(agentId, p)
+    }
+    return p.finally(() => this.connecting.delete(agentId))
+  }
+
+  async start(): Promise<void> {
+    const validation = validateWorkflow(this.request.source, this.request.agent)
+    if (!validation.ok || !validation.meta) {
+      const msg = validation.diagnostics.find((d) => d.severity === 'error')?.message ?? 'Invalid workflow'
+      this.snapshot.error = msg
+      this.emit({ type: 'run:started', meta: { name: 'invalid', description: '' }, phases: [], agent: this.request.agent, cwd: this.cwd })
+      this.logAcp('error', 'validate', `Validation failed: ${msg}`)
+      this.finishRun('failed', msg)
+      return
+    }
+    const meta = validation.meta
+    this.snapshot.meta = meta
+    for (const d of validation.diagnostics) {
+      if (d.severity === 'warning') this.logAcp('warn', 'validate', d.message)
+    }
+    for (const [method, value] of Object.entries(this.request.methodConfig ?? {})) {
+      const msg = validateMethodConfig(method, value)
+      if (msg) {
+        const errText = `Invalid run config for ${method}: ${msg}`
+        this.snapshot.error = errText
+        this.emit({ type: 'run:started', meta, phases: [], agent: this.request.agent, cwd: this.cwd })
+        this.logAcp('error', 'validate', errText)
+        this.finishRun('failed', errText)
+        return
+      }
+    }
+    this.methodConfigs = this.resolveConfigs(meta)
+    if (meta.phases?.length) {
+      this.snapshot.phases = meta.phases.map((p) => ({ title: p.title, detail: p.detail, agentIds: [] }))
+      this.currentPhase = meta.phases[0].title
+    }
+    this.emit({ type: 'run:started', meta, phases: this.snapshot.phases, agent: this.request.agent, cwd: this.cwd })
+
+    this.setStatus('running')
+    // Pre-warm the DEFAULT backend so its modes/config surface immediately
+    // (preserving the "modes appear right away" UX). Non-default backends spawn
+    // lazily on their first agent() call. Only a DEFAULT-backend start failure
+    // fails the run; a non-default failure is a recoverable per-call error.
+    try {
+      await this.getConnection(this.request.agent)
+    } catch (err) {
+      const spec = ACP_AGENTS[this.request.agent]
+      this.finishRun('failed', `Failed to start ${spec.name} agent: ${err instanceof Error ? err.message : String(err)}`)
+      for (const conn of this.connections.values()) conn.close()
+      this.connections.clear()
+      return
+    }
+
+    const { code, headerLines } = instrumentWorkflow(validation.normalized)
+    this.headerLines = headerLines
+    try {
+      const result = await runVm(code, buildSandboxGlobals(this.hostHooks(), this.methodConfigs))
+      if (this.aborted) this.finishRun('cancelled')
+      else this.finishRun('completed', undefined, result)
+    } catch (err) {
+      if (err instanceof WorkflowAbortError || this.aborted) this.finishRun('cancelled')
+      else this.finishRun('failed', err instanceof Error ? err.message : String(err))
+    } finally {
+      for (const conn of this.connections.values()) conn.close()
+      this.connections.clear()
+    }
+  }
+
+  private finishRun(status: RunStatus, error?: string, result?: unknown): void {
+    if (this.finished) return
+    this.finished = true
+    this.snapshot.finishedAt = Date.now()
+    if (error) this.snapshot.error = error
+    if (result !== undefined) this.snapshot.result = result
+    const stats: RunStats = {
+      agentCount: this.agentCounter,
+      completed: this.snapshot.agents.filter((a) => a.status === 'completed').length,
+      failed: this.snapshot.agents.filter((a) => a.status === 'failed').length,
+      durationMs: this.snapshot.finishedAt - this.snapshot.startedAt,
+      tokens: { total: this.spentTokens || undefined } as AgentTokenUsage,
+    }
+    this.snapshot.stats = stats
+    this.snapshot.status = status
+    if (error) this.logAcp('error', 'run_error', error)
+    this.logAcp('system', 'run_done', `Run ${status} — ${stats.agentCount} agents, ${stats.completed} ok, ${stats.failed} failed in ${(stats.durationMs / 1000).toFixed(1)}s`)
+    this.emit({ type: 'run:finished', status, result: this.snapshot.result, error, stats })
+  }
+}
