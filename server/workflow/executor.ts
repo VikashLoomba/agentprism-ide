@@ -27,6 +27,9 @@ export interface SandboxHost {
   /** Namespace -> { method: (args)=>Promise<result> }. Each namespace object is
    *  ALREADY frozen + host-bound + recorded by WorkflowRun.bindCapability. */
   capabilities: Record<string, Readonly<Record<string, (args: Json) => Promise<Json | null>>>>
+  /** The single `prompts` namespace: { name: (data)=>string }. PURE + SYNC.
+   *  Already frozen by WorkflowRun.bindPrompts. NOT recorded, NOT async. */
+  prompts: Readonly<Record<string, (data: Json) => string>>
 }
 
 /** Per-method resolved config, keyed by method name. */
@@ -115,6 +118,15 @@ export function buildSandboxGlobals(host: SandboxHost, config: MethodConfigMap =
     if (ns in scope) throw new Error(`capability namespace "${ns}" collides with a DSL global`)
     scope[ns] = obj // live host reference; vm.createContext contextifies in place
   }
+
+  // 1c. The single pure `prompts` namespace. Collision-guarded against DSL globals
+  //     AND against capability namespaces already injected in step 1b (cross-system
+  //     guard — capabilities never needed this since they were the sole injector).
+  //     host.prompts is ALREADY frozen by WorkflowRun.bindPrompts (no rebuild/refreeze).
+  if ('prompts' in scope) {
+    throw new Error('prompts namespace collides with a DSL global or capability')
+  }
+  scope.prompts = host.prompts // already frozen by WorkflowRun.bindPrompts
 
   // 2. Combinators built on top of the scope. Factories read OTHER globals
   //    (scope.parallel, ...) lazily inside the returned function, so the build

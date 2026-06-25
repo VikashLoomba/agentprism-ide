@@ -30,6 +30,9 @@ import { buildSandboxGlobals, runVm, type CheckpointOptions, type MethodConfigMa
 import { instrumentWorkflow, sourceLineFromStack } from './instrument.ts'
 import { inlineHelpers } from './inline.ts'
 import { loadCapabilities, getCapabilityModules, type LoadedCapabilities } from './capability-loader.ts'
+import { loadPrompts, getPromptTemplates, type LoadedPrompts } from './prompt-loader.ts'
+import type { PromptTemplate } from '../../shared/prompt-template.ts'
+import type { PromptCatalog } from '../../shared/prompt-resolve.ts'
 import { AgentLimitError, NonRecoverableWorkflowError, TokenBudgetError, WorkflowAbortError, isNonRecoverable } from './errors.ts'
 
 const shortid = customAlphabet('0123456789abcdefghijklmnopqrstuvwxyz', 8)
@@ -159,6 +162,11 @@ export class WorkflowRun {
   private capabilityModules = new Map<string, Capability>()
   /** Run-time capability catalog (project>user), threaded into validateWorkflow. */
   private capabilityCatalog?: CapabilityCatalog
+
+  /** Resolved + loaded prompt templates for this run (declared in meta.prompts). */
+  private promptModules = new Map<string, PromptTemplate>()
+  /** Run-time prompt catalog (project>user), threaded into validateWorkflow. */
+  private promptCatalog?: PromptCatalog
 
   private aborted = false
   private finished = false
@@ -669,6 +677,20 @@ export class WorkflowRun {
     }
   }
 
+  /* ----------------------------- host: prompts ---------------------------- */
+
+  /** Build the single `prompts` namespace object: { name: (data)=>string }.
+   *  Pure + synchronous: NO ctxFor (no secrets/log), NO runEffect (no counter, no
+   *  EffectCallState, no effect:* events, no null-on-failure, no abort plumbing).
+   *  Frozen to block sandbox monkey-patching, mirroring bindCapability's freeze. */
+  private bindPrompts(): Readonly<Record<string, (data: Json) => string>> {
+    const ns: Record<string, (data: Json) => string> = {}
+    for (const [name, tpl] of this.promptModules) {
+      ns[name] = (data: Json) => tpl.render(data) // key == name == identifier
+    }
+    return Object.freeze(ns)
+  }
+
   /* --------------------------- host: phase/log ---------------------------- */
 
   private phaseFn = (title: string): void => {
@@ -693,7 +715,7 @@ export class WorkflowRun {
     if (typeof script !== 'string' || !/export\s+const\s+meta/.test(script)) {
       throw new Error('workflow(): only inline workflow scripts are supported (pass a script string starting with `export const meta`).')
     }
-    const v = validateWorkflow(script, this.request.agent, undefined, this.capabilityCatalog)
+    const v = validateWorkflow(script, this.request.agent, undefined, this.capabilityCatalog, this.promptCatalog)
     if (!v.ok) throw new Error('Nested workflow failed validation: ' + v.diagnostics.map((d) => d.message).join('; '))
     const { source, headerBindings } = inlineHelpers(v.normalized)
     const { code } = instrumentWorkflow(source, headerBindings)
@@ -734,6 +756,7 @@ export class WorkflowRun {
       capabilities: Object.fromEntries(
         [...this.capabilityModules].map(([ns, cap]) => [ns, this.bindCapability(cap, this.ctxFor(cap))]),
       ),
+      prompts: this.bindPrompts(),
     }
   }
 
@@ -776,7 +799,18 @@ export class WorkflowRun {
       this.logAcp('warn', 'capabilities', `Failed to load capabilities: ${err instanceof Error ? err.message : String(err)}`)
     }
 
-    const validation = validateWorkflow(this.request.source, this.request.agent, undefined, this.capabilityCatalog)
+    // Load the prompt-template catalog/modules once for this run. Prompts have NO
+    // secrets (no process.env arg). Best-effort: a loader failure leaves the catalog
+    // undefined so validateWorkflow skips prompt resolution gracefully.
+    let loadedPrompts: LoadedPrompts | undefined
+    try {
+      loadedPrompts = await loadPrompts()
+      this.promptCatalog = loadedPrompts.catalog
+    } catch (err) {
+      this.logAcp('warn', 'prompts', `Failed to load prompts: ${err instanceof Error ? err.message : String(err)}`)
+    }
+
+    const validation = validateWorkflow(this.request.source, this.request.agent, undefined, this.capabilityCatalog, this.promptCatalog)
     if (!validation.ok || !validation.meta) {
       const msg = validation.diagnostics.find((d) => d.severity === 'error')?.message ?? 'Invalid workflow'
       this.snapshot.error = msg
@@ -791,6 +825,11 @@ export class WorkflowRun {
     // already-loaded modules so hostHooks() injects only declared+resolved globals.
     if (loaded && meta.capabilities?.length) {
       this.capabilityModules = getCapabilityModules(loaded, meta.capabilities)
+    }
+    // Resolve the workflow's declared prompt namespaces (project>user) to the
+    // already-loaded templates so hostHooks() injects only declared+resolved renders.
+    if (loadedPrompts && meta.prompts?.length) {
+      this.promptModules = getPromptTemplates(loadedPrompts, meta.prompts)
     }
     for (const d of validation.diagnostics) {
       if (d.severity === 'warning') this.logAcp('warn', 'validate', d.message)

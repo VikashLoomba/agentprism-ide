@@ -1,6 +1,7 @@
 import type {
   AgentsResponse,
   CapabilitiesResponse,
+  PromptsResponse,
   WorkflowFileContent,
   WorkflowFileInfo,
 } from '@shared/protocol'
@@ -19,6 +20,57 @@ export function fetchAgents(): Promise<AgentsResponse> {
 
 export function fetchCapabilities(): Promise<CapabilitiesResponse> {
   return fetch('/api/capabilities').then((r) => json<CapabilitiesResponse>(r))
+}
+
+export function fetchPrompts(): Promise<PromptsResponse> {
+  return fetch('/api/prompts').then((r) => json<PromptsResponse>(r))
+}
+
+export function fetchPromptFile(
+  tier: 'project' | 'user',
+  name: string,
+): Promise<{ name: string; content: string }> {
+  return fetch(`/api/prompts/${encodeURIComponent(tier)}/${encodeURIComponent(name)}`).then((r) =>
+    json<{ name: string; content: string }>(r),
+  )
+}
+
+export function savePromptFile(
+  tier: 'project' | 'user',
+  name: string,
+  content: string,
+): Promise<{ name: string; path: string; tier: 'project' | 'user'; modifiedAt: number }> {
+  return fetch(`/api/prompts/${encodeURIComponent(tier)}/${encodeURIComponent(name)}`, {
+    method: 'PUT',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ content }),
+  }).then((r) =>
+    json<{ name: string; path: string; tier: 'project' | 'user'; modifiedAt: number }>(r),
+  )
+}
+
+// Tool (capability) files — `name` is the full basename incl. extension (e.g. "jira.ts").
+export function fetchToolFile(
+  tier: 'project' | 'user',
+  name: string,
+): Promise<{ name: string; content: string }> {
+  return fetch(`/api/tools/${encodeURIComponent(tier)}/${encodeURIComponent(name)}`).then((r) =>
+    json<{ name: string; content: string }>(r),
+  )
+}
+
+export function saveToolFile(
+  tier: 'project' | 'user',
+  name: string,
+  content: string,
+): Promise<{ name: string; path: string; tier: 'project' | 'user'; modifiedAt: number }> {
+  return fetch(`/api/tools/${encodeURIComponent(tier)}/${encodeURIComponent(name)}`, {
+    method: 'PUT',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ content }),
+  }).then((r) =>
+    json<{ name: string; path: string; tier: 'project' | 'user'; modifiedAt: number }>(r),
+  )
 }
 
 export function fetchFiles(): Promise<WorkflowFileInfo[]> {

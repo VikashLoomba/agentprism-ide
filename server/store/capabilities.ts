@@ -86,3 +86,39 @@ export async function scanCapabilityFiles(): Promise<CapabilityFileInfo[]> {
 
   return [...byBareName.values()].sort((a, b) => b.modifiedAt - a.modifiedAt)
 }
+
+/**
+ * Read one tool/capability file by its FULL filename (incl. extension), guarded
+ * against traversal + containment. Powers the editor "open tool" flow (mirrors
+ * readPrompt in store/prompts.ts; capability extensions vary, so the caller passes
+ * the basename with its extension).
+ */
+export async function readCapabilityFile(
+  tierDir: string,
+  fileName: string,
+): Promise<{ path: string; content: string }> {
+  if (!isSafeFileName(fileName) || !CAPABILITY_EXTS.includes(path.extname(fileName))) {
+    throw new Error('Invalid tool file name (.ts/.js/.mjs only).')
+  }
+  const full = path.join(tierDir, fileName)
+  const real = await fs.realpath(full)
+  const rel = path.relative(await fs.realpath(tierDir), real)
+  if (rel.startsWith('..') || path.isAbsolute(rel)) throw new Error('Path escapes tools dir.')
+  return { path: full, content: await fs.readFile(real, 'utf8') }
+}
+
+/** Write one tool/capability file by full filename (safeName-guarded). */
+export async function writeCapabilityFile(
+  tierDir: string,
+  fileName: string,
+  content: string,
+): Promise<CapabilityFileInfo> {
+  if (!isSafeFileName(fileName) || !CAPABILITY_EXTS.includes(path.extname(fileName))) {
+    throw new Error('Invalid tool file name (.ts/.js/.mjs only).')
+  }
+  await fs.mkdir(tierDir, { recursive: true })
+  const full = path.join(tierDir, fileName)
+  await fs.writeFile(full, content, 'utf8')
+  const st = await fs.stat(full)
+  return { name: bareNameOf(fileName), path: full, tier: 'project', modifiedAt: st.mtimeMs }
+}

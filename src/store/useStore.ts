@@ -6,11 +6,13 @@ import type {
   CapabilityCatalogEntry,
   PermissionRequest,
   PermissionResponse,
+  PromptCatalogEntry,
   RunRequest,
   ServerMessage,
   WorkflowFileInfo,
 } from '@shared/protocol'
 import { resolveCapability, type CapabilityCatalog } from '@shared/capability-resolve'
+import { resolvePrompt, type PromptCatalog } from '@shared/prompt-resolve'
 import { validateWorkflow, type ValidateResult } from '@shared/validate'
 import { applyRunEvent } from './runReducer'
 import * as api from '@/lib/api'
@@ -29,17 +31,26 @@ function workflowDtsFor(
   agents: AcpAgentSpec[],
   defaultAgentId: AcpAgentId,
   capabilities?: CapabilityCatalogEntry[],
+  prompts?: PromptCatalogEntry[],
 ): string {
   return buildWorkflowDts(
     agents.filter((a) => a.installed),
     defaultAgentId,
     capabilities,
+    prompts,
   )
 }
 
 /** Build the isomorphic project>user catalog view from the flat fetched entry list. */
 function buildCapabilityCatalog(entries: CapabilityCatalogEntry[]): CapabilityCatalog {
   const catalog: CapabilityCatalog = { project: {}, user: {} }
+  for (const entry of entries) catalog[entry.tier][entry.name] = entry
+  return catalog
+}
+
+/** Build the isomorphic project>user prompt catalog view from the flat entry list. */
+function buildPromptCatalog(entries: PromptCatalogEntry[]): PromptCatalog {
+  const catalog: PromptCatalog = { project: {}, user: {} }
   for (const entry of entries) catalog[entry.tier][entry.name] = entry
   return catalog
 }
@@ -54,6 +65,21 @@ function scopedCapabilityEntries(
   const out: CapabilityCatalogEntry[] = []
   for (const raw of metaCapabilities) {
     const res = resolveCapability(catalog, raw)
+    if (res.resolved) out.push(catalog[res.resolved][res.bareName])
+  }
+  return out
+}
+
+/** The catalog entries a workflow's `meta.prompts` resolve to (project-first),
+ *  used to scope the `declare const prompts` dts to only declared templates. */
+function scopedPromptEntries(
+  catalog: PromptCatalog,
+  metaPrompts: string[] | undefined,
+): PromptCatalogEntry[] {
+  if (!metaPrompts) return []
+  const out: PromptCatalogEntry[] = []
+  for (const raw of metaPrompts) {
+    const res = resolvePrompt(catalog, raw)
     if (res.resolved) out.push(catalog[res.resolved][res.bareName])
   }
   return out
@@ -126,6 +152,19 @@ interface State {
   /** Derived project>user view of `capabilities`, threaded into validateWorkflow. */
   capabilityCatalog: CapabilityCatalog
 
+  /** Flat list of every available prompt template (both tiers), from /api/prompts. */
+  prompts: PromptCatalogEntry[]
+  /** Derived project>user view of `prompts`, threaded into validateWorkflow. */
+  promptCatalog: PromptCatalog
+
+  /** What kind of file the editor currently holds: a workflow script, a .hbs
+   *  prompt template, or a tool/capability .ts module. Non-workflow modes gate
+   *  off workflow-only editor machinery (markers, breakpoints, DSL .d.ts). */
+  openKind: 'workflow' | 'prompt' | 'tool'
+  /** Tier of the open prompt/tool file (so saves write back to the right dir);
+   *  null for workflows. */
+  openTier: 'project' | 'user' | null
+
   source: string
   fileName: string | null
   dirty: boolean
@@ -167,9 +206,12 @@ interface State {
   resetMethodConfig: (method: string) => void
 
   refreshCapabilities: () => Promise<void>
+  refreshPrompts: () => Promise<void>
   refreshFiles: () => Promise<void>
   openFile: (name: string) => Promise<void>
-  saveCurrent: (name?: string) => Promise<WorkflowFileInfo | undefined>
+  openPrompt: (tier: 'project' | 'user', name: string) => Promise<void>
+  openTool: (tier: 'project' | 'user', fileName: string) => Promise<void>
+  saveCurrent: (name?: string) => Promise<{ name: string } | undefined>
   deleteFileByName: (name: string) => Promise<void>
   newFile: () => void
 
@@ -200,6 +242,11 @@ export const useStore = create<State>((set, get) => {
 
     capabilities: [],
     capabilityCatalog: { project: {}, user: {} },
+
+    prompts: [],
+    promptCatalog: { project: {}, user: {} },
+    openKind: 'workflow',
+    openTier: null,
 
     source: DEFAULT_WORKFLOW,
     fileName: null,
@@ -233,11 +280,13 @@ export const useStore = create<State>((set, get) => {
         })
       }
       try {
-        const [{ agents, defaultCwd }, { capabilities }] = await Promise.all([
+        const [{ agents, defaultCwd }, { capabilities }, { prompts }] = await Promise.all([
           api.fetchAgents(),
           api.fetchCapabilities(),
+          api.fetchPrompts(),
         ])
         const capabilityCatalog = buildCapabilityCatalog(capabilities)
+        const promptCatalog = buildPromptCatalog(prompts)
         const selected = agents.find((a) => a.installed) ?? agents[0]
         const selectedAgent = selected?.id ?? 'claude'
         const validation = validateWorkflow(
@@ -245,12 +294,15 @@ export const useStore = create<State>((set, get) => {
           selectedAgent,
           installedAgentIds(agents),
           capabilityCatalog,
+          promptCatalog,
         )
         set({
           agents,
           defaultCwd,
           capabilities,
           capabilityCatalog,
+          prompts,
+          promptCatalog,
           cwd: get().cwd || defaultCwd,
           selectedAgent,
           selectedMode: selected?.defaultModes.currentModeId ?? 'default',
@@ -258,6 +310,7 @@ export const useStore = create<State>((set, get) => {
             agents,
             selectedAgent,
             scopedCapabilityEntries(capabilityCatalog, validation.meta?.capabilities),
+            scopedPromptEntries(promptCatalog, validation.meta?.prompts),
           ),
           validation,
         })
@@ -270,25 +323,30 @@ export const useStore = create<State>((set, get) => {
     setSource(source) {
       const s = get()
       const prevCaps = s.validation.meta?.capabilities
+      const prevPrompts = s.validation.meta?.prompts
       const validation = validateWorkflow(
         source,
         s.selectedAgent,
         installedAgentIds(s.agents),
         s.capabilityCatalog,
+        s.promptCatalog,
       )
       const nextCaps = validation.meta?.capabilities
-      // Re-inject capability dts only when the declared `meta.capabilities` set changes.
+      const nextPrompts = validation.meta?.prompts
+      // Re-inject dts only when the declared `meta.capabilities`/`meta.prompts` set changes.
       const capsChanged = JSON.stringify(prevCaps) !== JSON.stringify(nextCaps)
+      const promptsChanged = JSON.stringify(prevPrompts) !== JSON.stringify(nextPrompts)
       set({
         source,
         dirty: true,
         validation,
-        ...(capsChanged
+        ...(capsChanged || promptsChanged
           ? {
               workflowDts: workflowDtsFor(
                 s.agents,
                 s.selectedAgent,
                 scopedCapabilityEntries(s.capabilityCatalog, nextCaps),
+                scopedPromptEntries(s.promptCatalog, nextPrompts),
               ),
             }
           : {}),
@@ -316,6 +374,7 @@ export const useStore = create<State>((set, get) => {
         id,
         installedAgentIds(agents),
         s.capabilityCatalog,
+        s.promptCatalog,
       )
       set({
         selectedAgent: id,
@@ -324,6 +383,7 @@ export const useStore = create<State>((set, get) => {
           agents,
           id,
           scopedCapabilityEntries(s.capabilityCatalog, validation.meta?.capabilities),
+          scopedPromptEntries(s.promptCatalog, validation.meta?.prompts),
         ),
         validation,
       })
@@ -364,6 +424,7 @@ export const useStore = create<State>((set, get) => {
           s.selectedAgent,
           installedAgentIds(s.agents),
           capabilityCatalog,
+          s.promptCatalog,
         )
         set({
           capabilities,
@@ -373,6 +434,35 @@ export const useStore = create<State>((set, get) => {
             s.agents,
             s.selectedAgent,
             scopedCapabilityEntries(capabilityCatalog, validation.meta?.capabilities),
+            scopedPromptEntries(s.promptCatalog, validation.meta?.prompts),
+          ),
+        })
+      } catch (err) {
+        set({ lastError: err instanceof Error ? err.message : String(err) })
+      }
+    },
+
+    async refreshPrompts() {
+      try {
+        const { prompts } = await api.fetchPrompts()
+        const promptCatalog = buildPromptCatalog(prompts)
+        const s = get()
+        const validation = validateWorkflow(
+          s.source,
+          s.selectedAgent,
+          installedAgentIds(s.agents),
+          s.capabilityCatalog,
+          promptCatalog,
+        )
+        set({
+          prompts,
+          promptCatalog,
+          validation,
+          workflowDts: workflowDtsFor(
+            s.agents,
+            s.selectedAgent,
+            scopedCapabilityEntries(s.capabilityCatalog, validation.meta?.capabilities),
+            scopedPromptEntries(promptCatalog, validation.meta?.prompts),
           ),
         })
       } catch (err) {
@@ -396,25 +486,77 @@ export const useStore = create<State>((set, get) => {
         s.selectedAgent,
         installedAgentIds(s.agents),
         s.capabilityCatalog,
+        s.promptCatalog,
       )
       set({
         source: content,
         fileName: name,
+        openKind: 'workflow',
+        openTier: null,
         dirty: false,
         validation,
         workflowDts: workflowDtsFor(
           s.agents,
           s.selectedAgent,
           scopedCapabilityEntries(s.capabilityCatalog, validation.meta?.capabilities),
+          scopedPromptEntries(s.promptCatalog, validation.meta?.prompts),
         ),
         breakpoints: [],
       })
     },
 
+    async openPrompt(tier, name) {
+      const { content } = await api.fetchPromptFile(tier, name)
+      // A .hbs prompt template is NOT a workflow: skip validation, dts injection,
+      // and breakpoints. The HandlebarsPreview renders it against sample data.
+      set({
+        source: content,
+        fileName: `${name}.hbs`,
+        openKind: 'prompt',
+        openTier: tier,
+        dirty: false,
+        breakpoints: [],
+      })
+    },
+
+    async openTool(tier, fileName) {
+      const { content } = await api.fetchToolFile(tier, fileName)
+      // A tool/capability .ts module is NOT a workflow: open it as a plain
+      // TypeScript buffer and gate off the workflow-only editor machinery.
+      set({
+        source: content,
+        fileName,
+        openKind: 'tool',
+        openTier: tier,
+        dirty: false,
+        breakpoints: [],
+      })
+    },
+
     async saveCurrent(name) {
-      const fileName = name ?? get().fileName
+      const s = get()
+      // Dispatch by what the editor currently holds so each kind saves to its
+      // own backing route (workflows / prompts / tools), never the wrong one.
+      if (s.openKind === 'prompt') {
+        const fileName = name ?? s.fileName
+        if (!fileName || !s.openTier) throw new Error('No prompt file')
+        const bare = fileName.replace(/\.hbs$/, '')
+        const info = await api.savePromptFile(s.openTier, bare, s.source)
+        set({ dirty: false })
+        await get().refreshPrompts()
+        return { name: info.name }
+      }
+      if (s.openKind === 'tool') {
+        const fileName = name ?? s.fileName
+        if (!fileName || !s.openTier) throw new Error('No tool file')
+        const info = await api.saveToolFile(s.openTier, fileName, s.source)
+        set({ dirty: false })
+        await get().refreshCapabilities()
+        return { name: info.name }
+      }
+      const fileName = name ?? s.fileName
       if (!fileName) throw new Error('No file name')
-      const info = await api.saveFile(fileName, get().source)
+      const info = await api.saveFile(fileName, s.source)
       set({ fileName: info.name, dirty: false })
       await get().refreshFiles()
       return info
@@ -433,16 +575,20 @@ export const useStore = create<State>((set, get) => {
         s.selectedAgent,
         installedAgentIds(s.agents),
         s.capabilityCatalog,
+        s.promptCatalog,
       )
       set({
         source: DEFAULT_WORKFLOW,
         fileName: null,
+        openKind: 'workflow',
+        openTier: null,
         dirty: false,
         validation,
         workflowDts: workflowDtsFor(
           s.agents,
           s.selectedAgent,
           scopedCapabilityEntries(s.capabilityCatalog, validation.meta?.capabilities),
+          scopedPromptEntries(s.promptCatalog, validation.meta?.prompts),
         ),
         breakpoints: [],
       })
@@ -512,6 +658,7 @@ export const useStore = create<State>((set, get) => {
             selectedAgent,
             installedAgentIds(msg.agents),
             s.capabilityCatalog,
+            s.promptCatalog,
           )
           set({
             agents: msg.agents,
@@ -519,6 +666,7 @@ export const useStore = create<State>((set, get) => {
               msg.agents,
               selectedAgent,
               scopedCapabilityEntries(s.capabilityCatalog, validation.meta?.capabilities),
+              scopedPromptEntries(s.promptCatalog, validation.meta?.prompts),
             ),
             validation,
           })

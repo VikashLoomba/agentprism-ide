@@ -8,10 +8,21 @@ import { z } from 'zod'
 import { ACP_AGENT_LIST } from '../shared/agents.ts'
 import type { AcpAgentSpec } from '../shared/agents.ts'
 import { validateWorkflow } from '../shared/validate.ts'
-import type { AgentsResponse, CapabilitiesResponse, ClientMessage, ServerMessage } from '../shared/protocol.ts'
-import { PORT, DEFAULT_CWD, AGENT_BINS } from './config.ts'
+import type { AgentsResponse, CapabilitiesResponse, ClientMessage, PromptsResponse, ServerMessage } from '../shared/protocol.ts'
+import {
+  PORT,
+  DEFAULT_CWD,
+  AGENT_BINS,
+  PROJECT_PROMPTS_DIR,
+  USER_PROMPTS_DIR,
+  PROJECT_TOOLS_DIR,
+  USER_TOOLS_DIR,
+} from './config.ts'
 import { listWorkflows, readWorkflow, writeWorkflow, deleteWorkflow } from './store/workflows.ts'
 import { loadCapabilities } from './workflow/capability-loader.ts'
+import { readCapabilityFile, writeCapabilityFile } from './store/capabilities.ts'
+import { loadPrompts } from './workflow/prompt-loader.ts'
+import { readPrompt, writePrompt } from './store/prompts.ts'
 import { RunManager } from './run-manager.ts'
 
 function isInstalled(agentId: string): boolean {
@@ -88,6 +99,68 @@ app.get('/api/capabilities', async (_req, res, next) => {
   }
 })
 
+app.get('/api/prompts', async (_req, res, next) => {
+  try {
+    const { entries } = await loadPrompts()
+    const body: PromptsResponse = { prompts: entries }
+    res.json(body)
+  } catch (err) {
+    next(err)
+  }
+})
+
+function promptDirFor(tier: string): string {
+  if (tier === 'project') return PROJECT_PROMPTS_DIR
+  if (tier === 'user') return USER_PROMPTS_DIR
+  throw new Error('Unknown prompt tier')
+}
+
+app.get('/api/prompts/:tier/:name', async (req, res) => {
+  try {
+    const { content } = await readPrompt(promptDirFor(req.params.tier), req.params.name)
+    res.json({ name: req.params.name, content })
+  } catch {
+    res.status(404).json({ error: 'Prompt not found' })
+  }
+})
+
+const savePromptSchema = z.object({ content: z.string() })
+app.put('/api/prompts/:tier/:name', async (req, res, next) => {
+  try {
+    const { content } = savePromptSchema.parse(req.body)
+    res.json(await writePrompt(promptDirFor(req.params.tier), req.params.name, content))
+  } catch (err) {
+    if (err instanceof z.ZodError) return res.status(400).json({ error: 'content is required' })
+    next(err)
+  }
+})
+
+function toolDirFor(tier: string): string {
+  if (tier === 'project') return PROJECT_TOOLS_DIR
+  if (tier === 'user') return USER_TOOLS_DIR
+  throw new Error('Unknown tool tier')
+}
+
+app.get('/api/tools/:tier/:name', async (req, res) => {
+  try {
+    const { content } = await readCapabilityFile(toolDirFor(req.params.tier), req.params.name)
+    res.json({ name: req.params.name, content })
+  } catch {
+    res.status(404).json({ error: 'Tool not found' })
+  }
+})
+
+const saveToolSchema = z.object({ content: z.string() })
+app.put('/api/tools/:tier/:name', async (req, res, next) => {
+  try {
+    const { content } = saveToolSchema.parse(req.body)
+    res.json(await writeCapabilityFile(toolDirFor(req.params.tier), req.params.name, content))
+  } catch (err) {
+    if (err instanceof z.ZodError) return res.status(400).json({ error: 'content is required' })
+    next(err)
+  }
+})
+
 const validateSchema = z.object({ source: z.string() })
 app.post('/api/validate', async (req, res, next) => {
   let source: string
@@ -98,7 +171,8 @@ app.post('/api/validate', async (req, res, next) => {
   }
   try {
     const { catalog } = await loadCapabilities(process.env)
-    res.json(validateWorkflow(source, undefined, undefined, catalog))
+    const { catalog: promptCatalog } = await loadPrompts()
+    res.json(validateWorkflow(source, undefined, undefined, catalog, promptCatalog))
   } catch (err) {
     next(err)
   }

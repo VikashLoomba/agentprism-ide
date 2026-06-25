@@ -1,7 +1,7 @@
 import { useEffect } from 'react'
-import { FilePlus2, RefreshCw, Trash2, FileCode2, Wrench, Share2, AlertTriangle } from 'lucide-react'
+import { FilePlus2, RefreshCw, Trash2, FileCode2, Wrench, Share2, AlertTriangle, MessageSquare } from 'lucide-react'
 import { toast } from 'sonner'
-import type { CapabilityCatalogEntry } from '@shared/protocol'
+import type { CapabilityCatalogEntry, PromptCatalogEntry } from '@shared/protocol'
 import { useStore } from '@/store/useStore'
 import { Button } from '@/components/ui/button'
 import { ScrollArea } from '@/components/ui/scroll-area'
@@ -16,6 +16,9 @@ export function FileSidebar() {
   const deleteFileByName = useStore((s) => s.deleteFileByName)
   const capabilities = useStore((s) => s.capabilities)
   const usedCapabilities = useStore((s) => s.validation.meta?.capabilities)
+  const prompts = useStore((s) => s.prompts)
+  const openPrompt = useStore((s) => s.openPrompt)
+  const openTool = useStore((s) => s.openTool)
 
   useEffect(() => {
     refreshFiles()
@@ -40,26 +43,40 @@ export function FileSidebar() {
     }
   }
 
-  // Tool files are world-touching capabilities loaded host-side; they are opened
-  // read-only by their absolute source path (never editable in the IDE here).
+  // Tool/capability .ts modules open into the editor (TypeScript) via the real
+  // /api/tools/:tier/:name route — editable + saveable, like workflows/prompts.
+  // Opening is allowed even when a tool has a loadError, so it can be fixed.
   async function handleOpenTool(cap: CapabilityCatalogEntry) {
-    if (cap.loadError) {
-      toast.error(`${cap.name}: ${cap.loadError}`)
+    const fileName = cap.path.split('/').pop()
+    if (!fileName) {
+      toast.error(`Could not resolve a filename for ${cap.name}`)
       return
     }
     try {
-      const res = await fetch(`/api/file?path=${encodeURIComponent(cap.path)}`)
-      if (!res.ok) throw new Error(`${res.status} ${res.statusText}`)
-      const { content } = (await res.json()) as { content: string }
-      useStore.getState().setSource(content)
-      toast.info(`Opened ${cap.name} (read-only — edit on disk at ${cap.path})`)
-    } catch {
-      toast.error(`Could not open ${cap.name}. Edit it on disk: ${cap.path}`)
+      await openTool(cap.tier, fileName)
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : `Could not open ${cap.name}`)
+    }
+  }
+
+  // Prompt templates are pure Handlebars files opened into the editor (with a
+  // live-preview pane) via the real /api/prompts/:tier/:name route.
+  async function handleOpenPrompt(prompt: PromptCatalogEntry) {
+    if (prompt.loadError) {
+      toast.error(`${prompt.name}: ${prompt.loadError}`)
+      return
+    }
+    try {
+      await openPrompt(prompt.tier, prompt.name)
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : `Could not open ${prompt.name}`)
     }
   }
 
   const projectTools = capabilities.filter((c) => c.tier === 'project')
   const userTools = capabilities.filter((c) => c.tier === 'user')
+  const projectPrompts = prompts.filter((p) => p.tier === 'project')
+  const userPrompts = prompts.filter((p) => p.tier === 'user')
 
   // Non-portable hint: the active workflow leans on a user-tier (Shared tools)
   // capability, so it won't run unchanged for someone without that mount.
@@ -85,7 +102,7 @@ export function FileSidebar() {
           </Button>
         </div>
       </div>
-      <ScrollArea className="flex-1">
+      <ScrollArea className="min-h-0 flex-1">
         <div className="px-2 pb-2">
           {files.length === 0 && (
             <p className="px-2 py-6 text-center text-xs text-muted-foreground">
@@ -133,6 +150,24 @@ export function FileSidebar() {
             }
           />
         )}
+
+        {projectPrompts.length > 0 && (
+          <PromptSection
+            label="Prompts"
+            icon={<MessageSquare className="size-3.5 shrink-0 text-primary/80" />}
+            prompts={projectPrompts}
+            onOpen={handleOpenPrompt}
+          />
+        )}
+
+        {userPrompts.length > 0 && (
+          <PromptSection
+            label="Shared prompts"
+            icon={<MessageSquare className="size-3.5 shrink-0 text-primary/80" />}
+            prompts={userPrompts}
+            onOpen={handleOpenPrompt}
+          />
+        )}
       </ScrollArea>
     </div>
   )
@@ -174,6 +209,42 @@ function ToolSection({
         {hint && (
           <p className="px-2 pt-1 text-[11px] leading-snug text-amber-600 dark:text-amber-500">{hint}</p>
         )}
+      </div>
+    </div>
+  )
+}
+
+function PromptSection({
+  label,
+  icon,
+  prompts,
+  onOpen,
+}: {
+  label: string
+  icon: React.ReactNode
+  prompts: PromptCatalogEntry[]
+  onOpen: (prompt: PromptCatalogEntry) => void
+}) {
+  return (
+    <div className="border-t border-border/50">
+      <div className="px-3 py-2">
+        <span className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">{label}</span>
+      </div>
+      <div className="px-2 pb-2">
+        {prompts.map((prompt) => (
+          <button
+            key={`${prompt.tier}:${prompt.name}`}
+            onClick={() => onOpen(prompt)}
+            title={prompt.loadError ? prompt.loadError : prompt.path}
+            className="group flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-[13px] transition-colors hover:bg-accent/50"
+          >
+            {icon}
+            <span className="min-w-0 flex-1 truncate">{prompt.name}</span>
+            {prompt.loadError && (
+              <AlertTriangle className="size-3.5 shrink-0 text-amber-500" />
+            )}
+          </button>
+        ))}
       </div>
     </div>
   )

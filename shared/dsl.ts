@@ -54,6 +54,15 @@ export interface WorkflowMeta {
    * tier). Unresolved names are a hard validation error.
    */
   capabilities?: string[]
+  /**
+   * Declared prompt-template (Handlebars) namespaces this workflow renders via
+   * `prompts.<name>(data)`. Each entry is a bare identifier resolved project-local
+   * `prompts/` first, then user-level `~/.agentprism/prompts/`. May be tier-qualified
+   * with `project:`, `user:`, or `@me/` (`@me/foo` and `user:foo` both pin the user
+   * tier; `project:foo` pins the project tier). Unresolved names are a hard
+   * validation error.
+   */
+  prompts?: string[]
 }
 
 export interface AgentOptions {

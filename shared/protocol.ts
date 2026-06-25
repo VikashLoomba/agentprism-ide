@@ -1,5 +1,6 @@
 import type { AcpAgentId, AcpAgentSpec } from './agents.ts'
 import type { RunEvent, RunSnapshot } from './events.ts'
+import type { PromptParam } from './prompt-frontmatter.ts'
 
 /** Parameters to launch a workflow run. */
 export interface RunRequest {
@@ -104,7 +105,8 @@ export interface CapabilityCatalogEntry {
   secretStatus: Record<string, { present: boolean }>
   /** Effect method names (for the palette / hovers). */
   methods: string[]
-  /** Hand-written ambient `declare const <name>: { ... }` body, or '' for loose. */
+  /** Ambient `declare const <name>: { ... }` body, derived from the effect
+   *  signatures server-side (see derive-capability-dts.ts); '' for loose. */
   dts: string
   /** Absolute source path (for "open in editor"). */
   path: string
@@ -115,4 +117,29 @@ export interface CapabilityCatalogEntry {
 
 export interface CapabilitiesResponse {
   capabilities: CapabilityCatalogEntry[]   // both tiers, tier-tagged
+}
+
+/** Safe metadata view of one prompt template (safe to ship to browser; prompt
+ *  bodies are non-sensitive by design — NO secrets, NO effect fns). */
+export interface PromptCatalogEntry {
+  /** Namespace member name (== filename bareName == JS identifier). */
+  name: string
+  tier: 'project' | 'user'
+  /** Declared parameters (drives typing + preview sample seed). */
+  params: PromptParam[]
+  /** TS object-type literal for the `prompts.<name>(data: <T>)` dts member. */
+  paramsDts: string
+  /** Hover/tooltip snippet ONLY (truncated). NEVER used as a render input. */
+  preview: string
+  /** FULL template body (frontmatter-stripped source). Used by the live preview
+   *  to register partials at full fidelity so preview render == server render. */
+  body: string
+  path: string
+  modifiedAt: number
+  /** Populated when frontmatter parse / Handlebars compile failed. */
+  loadError?: string
+}
+
+export interface PromptsResponse {
+  prompts: PromptCatalogEntry[]   // both tiers, tier-tagged
 }

@@ -11,7 +11,16 @@ export default defineConfig({
     alias: {
       '@': path.resolve(import.meta.dirname, './src'),
       '@shared': path.resolve(import.meta.dirname, './shared'),
+      // If the verify build surfaces a "require is not defined" warning from the
+      // live Handlebars compile in the prompt preview, uncomment the alias below to
+      // force the full CJS build (per prompt-template-system-design §2.2):
+      // handlebars: 'handlebars/dist/cjs/handlebars.js',
     },
+  },
+  // The Handlebars FULL build is required because the prompt live-preview compiles
+  // user input at runtime; pre-bundle it so the browser gets a single optimized dep.
+  optimizeDeps: {
+    include: ['handlebars'],
   },
   server: {
     port: 5173,

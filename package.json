@@ -37,6 +37,7 @@
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
     "express": "^5.2.1",
+    "handlebars": "^4.7.9",
     "lucide-react": "^1.21.0",
     "magic-string": "^0.30.21",
     "monaco-editor": "^0.55.1",

@@ -11,6 +11,8 @@ export function WorkflowEditor() {
   const pauseCollection = useRef<editor.IEditorDecorationsCollection | null>(null)
 
   const source = useStore((s) => s.source)
+  const openKind = useStore((s) => s.openKind)
+  const fileName = useStore((s) => s.fileName)
   const validation = useStore((s) => s.validation)
   const workflowDts = useStore((s) => s.workflowDts)
   const breakpoints = useStore((s) => s.breakpoints)
@@ -18,11 +20,31 @@ export function WorkflowEditor() {
   const toggleBreakpoint = useStore((s) => s.toggleBreakpoint)
   const setSource = useStore((s) => s.setSource)
 
+  // A non-workflow file (.hbs prompt template or .ts tool module) is not a
+  // workflow: acorn markers, breakpoint glyphs, pause decorations, and the
+  // workflow .d.ts are all meaningless here. Because @monaco-editor/react reuses
+  // ONE model across the language flip, we must ACTIVELY CLEAR any stale workflow
+  // markers/decorations on entering a non-workflow file (R3) — early-returning
+  // alone would leave the prior workflow's squiggles, breakpoint glyphs, and
+  // pause line painted over the new content.
+  function clearWorkflowAnnotations() {
+    const ed = editorRef.current
+    const mon = monacoRef.current
+    const model = ed?.getModel()
+    if (mon && model) mon.editor.setModelMarkers(model, 'agentprism', [])
+    bpCollection.current?.set([])
+    pauseCollection.current?.clear()
+  }
+
   function updateMarkers() {
     const ed = editorRef.current
     const mon = monacoRef.current
     const model = ed?.getModel()
     if (!ed || !mon || !model) return
+    if (openKind !== 'workflow') {
+      mon.editor.setModelMarkers(model, 'agentprism', [])
+      return
+    }
     mon.editor.setModelMarkers(
       model,
       'agentprism',
@@ -40,6 +62,10 @@ export function WorkflowEditor() {
   function updateBreakpoints() {
     const mon = monacoRef.current
     if (!bpCollection.current || !mon) return
+    if (openKind !== 'workflow') {
+      bpCollection.current.set([])
+      return
+    }
     bpCollection.current.set(
       breakpoints.map((line) => ({
         range: new mon.Range(line, 1, line, 1),
@@ -55,6 +81,10 @@ export function WorkflowEditor() {
     const ed = editorRef.current
     const mon = monacoRef.current
     if (!ed || !mon || !pauseCollection.current) return
+    if (openKind !== 'workflow') {
+      pauseCollection.current.clear()
+      return
+    }
     if (pauseLine) {
       pauseCollection.current.set([
         {
@@ -78,23 +108,41 @@ export function WorkflowEditor() {
         toggleBreakpoint(e.target.position.lineNumber)
       }
     })
-    updateWorkflowDts(mon, workflowDts)
+    if (openKind !== 'workflow') clearWorkflowAnnotations()
+    updateWorkflowDts(mon, openKind !== 'workflow' ? '' : workflowDts)
     updateMarkers()
     updateBreakpoints()
     updatePause()
   }
 
+  // On the workflow<->prompt flip, clear stale workflow annotations first (R3).
+  useEffect(() => {
+    if (openKind !== 'workflow') clearWorkflowAnnotations()
+    updateMarkers()
+    updateBreakpoints()
+    updatePause()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [openKind])
   useEffect(() => {
     const mon = monacoRef.current
-    if (mon) updateWorkflowDts(mon, workflowDts)
-  }, [workflowDts])
-  useEffect(updateMarkers, [validation])
-  useEffect(updateBreakpoints, [breakpoints])
-  useEffect(updatePause, [pauseLine])
+    // Workflow .d.ts is meaningless for prompt/tool files; clear it for them.
+    if (mon) updateWorkflowDts(mon, openKind !== 'workflow' ? '' : workflowDts)
+  }, [workflowDts, openKind])
+  useEffect(updateMarkers, [validation, openKind])
+  useEffect(updateBreakpoints, [breakpoints, openKind])
+  useEffect(updatePause, [pauseLine, openKind])
+
+  // A tool .ts buffer gets a real file:// model URI so the editor's TS service can
+  // resolve its relative `../shared/capability.ts` import against the injected cap
+  // lib (full intellisense, no phantom "cannot find module"). Workflow/prompt
+  // buffers stay on the default single reused model — preserving the R3 stale-
+  // annotation clearing that relies on one model across the language flip.
+  const modelPath = openKind === 'tool' && fileName ? `file:///tools/${fileName}` : undefined
 
   return (
     <Editor
-      language="javascript"
+      path={modelPath}
+      language={openKind === 'prompt' ? 'handlebars' : openKind === 'tool' ? 'typescript' : 'javascript'}
       theme={MONACO_THEME}
       value={source}
       beforeMount={(monaco) => configureMonaco(monaco)}

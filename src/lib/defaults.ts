@@ -16,3 +16,12 @@ return await agent(
   { config: { model: 'sonnet' }, label: 'bullet summary' },
 )
 `
+
+export const DEFAULT_PROMPT = `---
+{ "params": [
+  { "name": "topic", "type": "string", "description": "What the prompt is about", "example": "merge requests" }
+] }
+---
+Write a short, clear instruction about {{topic}}.
+`
+

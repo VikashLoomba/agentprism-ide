@@ -290,6 +290,7 @@ export const CAPABILITY_RESERVED_NAMES: ReadonlySet<string> = new Set<string>([
   'globalThis',
   'process',
   'console',
+  'prompts', // the prompt-namespace global — capabilities must not shadow it
 ])
 
 /** Names of globals that ultimately spawn agents (validator "agent() required" hint). */

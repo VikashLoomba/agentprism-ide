@@ -5,6 +5,7 @@ import { Header } from '@/features/layout/Header'
 import { FileSidebar } from '@/features/files/FileSidebar'
 import { MetaPanel } from '@/features/meta/MetaPanel'
 import { WorkflowEditor } from '@/features/editor/WorkflowEditor'
+import { HandlebarsPreview } from '@/features/editor/HandlebarsPreview'
 import { EditorStatusBar } from '@/features/editor/EditorStatusBar'
 import { RunPanel } from '@/features/run/RunPanel'
 import { PermissionDialog } from '@/features/run/PermissionDialog'
@@ -16,6 +17,7 @@ const VRESIZE =
 
 export default function App() {
   const init = useStore((s) => s.init)
+  const openKind = useStore((s) => s.openKind)
   useEffect(() => {
     init()
   }, [init])
@@ -46,11 +48,23 @@ export default function App() {
 
         <PanelResizeHandle className={HRESIZE} />
 
-        {/* Center: editor */}
+        {/* Center: editor (+ Handlebars live preview when a prompt is open) */}
         <Panel defaultSize={45} minSize={25}>
           <div className="flex h-full flex-col">
             <div className="min-h-0 flex-1">
-              <WorkflowEditor />
+              {openKind === 'prompt' ? (
+                <PanelGroup direction="vertical" className="min-h-0 flex-1">
+                  <Panel defaultSize={60} minSize={20}>
+                    <WorkflowEditor />
+                  </Panel>
+                  <PanelResizeHandle className={VRESIZE} />
+                  <Panel defaultSize={40} minSize={15}>
+                    <HandlebarsPreview />
+                  </Panel>
+                </PanelGroup>
+              ) : (
+                <WorkflowEditor />
+              )}
             </div>
             <EditorStatusBar />
           </div>

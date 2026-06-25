@@ -1,0 +1,28 @@
+---
+{ "params": [
+  { "name": "acceptanceCriteria", "type": "string[]", "description": "Checklist the MR must satisfy",
+    "example": ["Has tests", "Updates docs", "No console.log left"] },
+  { "name": "comments", "type": "string[]", "description": "Existing review comments to consider",
+    "example": ["Nit: rename foo", "Consider edge case for empty input"] },
+  { "name": "diff", "type": "string", "description": "The unified diff under review",
+    "example": "diff --git a/x.ts b/x.ts\n+ const y = 1" }
+] }
+---
+You are reviewing a merge request. Evaluate the diff against the acceptance criteria.
+
+## Acceptance criteria
+{{> criteriaList criteria=acceptanceCriteria}}
+
+{{#if comments}}
+## Existing review comments
+{{#each comments}}
+- {{this}}
+{{/each}}
+{{/if}}
+
+## Diff
+```
+{{diff}}
+```
+
+Return: a verdict (approve / request-changes), then one bullet per unmet criterion.

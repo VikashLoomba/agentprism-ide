@@ -20,6 +20,8 @@ import type { AcpAgentId } from './agents.ts'
 import { AGENT_PRODUCER_NAMES, DSL_METHOD_MAP, validateMethodConfig } from './dsl-registry.ts'
 import { resolveCapability } from './capability-resolve.ts'
 import type { CapabilityCatalog } from './capability-resolve.ts'
+import { resolvePrompt } from './prompt-resolve.ts'
+import type { PromptCatalog } from './prompt-resolve.ts'
 
 export type DiagnosticSeverity = 'error' | 'warning' | 'info'
 
@@ -189,6 +191,18 @@ function validateMeta(meta: unknown): string[] {
       }
     }
   }
+  if (m.prompts !== undefined) {
+    if (!Array.isArray(m.prompts)) {
+      errors.push('meta.prompts must be an array of strings')
+    } else {
+      for (const p of m.prompts) {
+        if (typeof p !== 'string' || p.trim() === '') {
+          errors.push('each meta.prompts entry must be a non-empty string')
+          break
+        }
+      }
+    }
+  }
   if (m.config !== undefined) {
     if (typeof m.config !== 'object' || m.config === null || Array.isArray(m.config)) {
       errors.push('meta.config must be an object keyed by method name (e.g. { verify: { reviewers: 3 } })')
@@ -219,6 +233,7 @@ export function validateWorkflow(
   selectedAgentId?: AcpAgentId,
   connectedAgentIds?: AcpAgentId[],
   capabilityCatalog?: CapabilityCatalog,
+  promptCatalog?: PromptCatalog,
 ): ValidateResult {
   const normalized = normalizeScript(rawSource)
   const diagnostics: Diagnostic[] = []
@@ -307,7 +322,7 @@ export function validateWorkflow(
           // catalog. Done here, not in validateMeta, because it needs the AST
           // element locations and the catalog. Skipped entirely when no catalog
           // is supplied (graceful degradation).
-          if (capabilityCatalog) {
+          if (capabilityCatalog || promptCatalog) {
             const metaObj = init as unknown as { type: string; properties?: Node[] }
             if (metaObj.type === 'ObjectExpression' && Array.isArray(metaObj.properties)) {
               for (const prop of metaObj.properties) {
@@ -323,19 +338,35 @@ export function validateWorkflow(
                     : p.key.type === 'Literal' && typeof p.key.value === 'string'
                       ? p.key.value
                       : null
-                if (keyName !== 'capabilities') continue
-                if (!p.value || p.value.type !== 'ArrayExpression' || !Array.isArray(p.value.elements)) continue
-                for (const el of p.value.elements) {
-                  if (!el) continue
-                  const elNode = el as unknown as { type: string; value?: unknown }
-                  if (elNode.type !== 'Literal' || typeof elNode.value !== 'string') continue
-                  const res = resolveCapability(capabilityCatalog, elNode.value)
-                  if (res.resolved === null) {
-                    diagnostics.push(diagAt(el, `capability "${res.bareName}" does not resolve`, 'error'))
-                  } else if (res.shadowsUser) {
-                    diagnostics.push(
-                      diagAt(el, `${res.bareName} -> ./tools, shadowing Shared tools`, 'info'),
-                    )
+                if (keyName === 'capabilities' && capabilityCatalog) {
+                  if (!p.value || p.value.type !== 'ArrayExpression' || !Array.isArray(p.value.elements)) continue
+                  for (const el of p.value.elements) {
+                    if (!el) continue
+                    const elNode = el as unknown as { type: string; value?: unknown }
+                    if (elNode.type !== 'Literal' || typeof elNode.value !== 'string') continue
+                    const res = resolveCapability(capabilityCatalog, elNode.value)
+                    if (res.resolved === null) {
+                      diagnostics.push(diagAt(el, `capability "${res.bareName}" does not resolve`, 'error'))
+                    } else if (res.shadowsUser) {
+                      diagnostics.push(
+                        diagAt(el, `${res.bareName} -> ./tools, shadowing Shared tools`, 'info'),
+                      )
+                    }
+                  }
+                } else if (keyName === 'prompts' && promptCatalog) {
+                  if (!p.value || p.value.type !== 'ArrayExpression' || !Array.isArray(p.value.elements)) continue
+                  for (const el of p.value.elements) {
+                    if (!el) continue
+                    const elNode = el as unknown as { type: string; value?: unknown }
+                    if (elNode.type !== 'Literal' || typeof elNode.value !== 'string') continue
+                    const res = resolvePrompt(promptCatalog, elNode.value)
+                    if (res.resolved === null) {
+                      diagnostics.push(diagAt(el, `prompt "${res.bareName}" does not resolve`, 'error'))
+                    } else if (res.shadowsUser) {
+                      diagnostics.push(
+                        diagAt(el, `${res.bareName} -> ./prompts, shadowing Shared prompts`, 'info'),
+                      )
+                    }
                   }
                 }
               }

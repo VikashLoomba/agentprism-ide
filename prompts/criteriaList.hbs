@@ -1,0 +1,6 @@
+---
+{ "params": [ { "name": "criteria", "type": "string[]", "description": "Criteria to render as a checklist" } ] }
+---
+{{#each criteria}}
+- [ ] {{this}}
+{{/each}}

@@ -15,7 +15,7 @@
 import type { AcpAgentId, AcpAgentSpec } from '@shared/agents'
 import { ACP_AGENT_LIST } from '@shared/agents'
 import { CAPABILITY_RESERVED_NAMES, DSL_METHODS } from '@shared/dsl-registry'
-import type { CapabilityCatalogEntry } from '@shared/protocol'
+import type { CapabilityCatalogEntry, PromptCatalogEntry } from '@shared/protocol'
 
 const PREAMBLE = `// AgentPrism workflow DSL — ambient globals.
 // Scripts are plain ES modules: the first statement must be
@@ -164,8 +164,9 @@ function buildAgentOptionsDts(agents: AcpAgentSpec[], defaultAgentId: AcpAgentId
 /**
  * One `declare const <ns>: { … }` ambient block per capability the workflow uses.
  *
- * The method surface is the capability's hand-written `dts` body, or a loose index
- * signature when absent. Each namespace is a global, like the DSL methods.
+ * The method surface is the capability's `dts` body — derived server-side from the
+ * effect signatures (see derive-capability-dts.ts) — or a loose index signature
+ * when absent. Each namespace is a global, like the DSL methods.
  *
  * C1 (capability-system-design §8): a capability whose name collides with a DSL
  * global (agent/args/cwd/budget/phase/…) or a core JS global is SKIPPED here, never
@@ -176,6 +177,22 @@ function buildCapabilityDts(entry: CapabilityCatalogEntry): string | null {
   if (CAPABILITY_RESERVED_NAMES.has(entry.name)) return null
   const body = entry.dts?.trim() ? entry.dts : '[method: string]: (args: any) => Promise<any>;'
   return `declare const ${entry.name}: {\n${body}\n};`
+}
+
+/**
+ * ONE `declare const prompts: { <name>(data: <T>): string; … }` block for the
+ * workflow's scoped prompt entries. Each member name is the entry's identifier
+ * bareName (Option A — guaranteed valid TS, no quoting/transform). Return is
+ * `string` (pure/sync), unlike capability methods (Promise<any>). Returns null
+ * when there are no scoped prompts so no empty block is emitted.
+ */
+function buildPromptsDts(entries: PromptCatalogEntry[]): string | null {
+  if (entries.length === 0) return null
+  const members = entries.map((e) => {
+    const doc = e.loadError ? `  /** ⚠ ${e.loadError} */\n` : ''
+    return `${doc}  ${e.name}(data: ${e.paramsDts}): string;`
+  })
+  return `declare const prompts: {\n${members.join('\n')}\n};`
 }
 
 /**
@@ -193,12 +210,14 @@ export function buildWorkflowDts(
   agents: AcpAgentSpec[],
   defaultAgentId: AcpAgentId,
   capabilities?: CapabilityCatalogEntry[],
+  prompts?: PromptCatalogEntry[],
 ): string {
   const configInterfaces = agents.map((spec) => buildAgentConfigInterface(spec))
   const agentOptions = buildAgentOptionsDts(agents, defaultAgentId)
   const capabilityDts = (capabilities ?? [])
     .map(buildCapabilityDts)
     .filter((block): block is string => block !== null)
+  const promptsDts = buildPromptsDts(prompts ?? [])
   return (
     [
       PREAMBLE,
@@ -206,6 +225,7 @@ export function buildWorkflowDts(
       agentOptions,
       ...DSL_METHODS.map((m) => m.dts),
       ...capabilityDts,
+      ...(promptsDts ? [promptsDts] : []),
     ].join('\n\n') + '\n'
   )
 }
