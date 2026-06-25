@@ -24,5 +24,4 @@ export default defineCapability({
       return { worktree }
     },
   },
-  dts: `checkoutWorktree(args: { repo: string; ref: string }): Promise<{ worktree: string } | null>;`,
 })

@@ -32,6 +32,4 @@ export default defineCapability({
         .join('\n')
     },
   },
-  dts: `getMrComments(args: { project: string; mr: number }): Promise<string[] | null>;
-getMrDiff(args: { project: string; mr: number }): Promise<string | null>;`,
 })

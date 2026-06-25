@@ -8,6 +8,7 @@
 import { pathToFileURL } from 'node:url'
 import { z } from 'zod'
 import { scanCapabilityFiles } from '../store/capabilities.ts'
+import { deriveCapabilityDts } from './derive-capability-dts.ts'
 import type { Capability, EffectFn } from '../../shared/capability.ts'
 import type { CapabilityCatalogEntry } from '../../shared/protocol.ts'
 import type { CapabilityCatalog } from '../../shared/capability-resolve.ts'
@@ -27,7 +28,6 @@ const capabilitySchema = z.object({
   name: z.string().regex(/^[A-Za-z_$][\w$]*$/, 'invalid capability namespace name'),
   secrets: z.array(z.string()),
   effects: z.record(z.string(), z.custom<EffectFn>((v) => typeof v === 'function', 'effect must be a function')),
-  dts: z.string().optional(),
 }) satisfies z.ZodType<Capability>
 
 export interface LoadedCapabilities {
@@ -62,6 +62,11 @@ function computeSecretStatus(
  */
 export async function loadCapabilities(env: NodeJS.ProcessEnv = process.env): Promise<LoadedCapabilities> {
   const scanned = (await scanCapabilityFiles()) as ScannedCapabilityFile[]
+
+  // Derive each capability's namespace `.d.ts` from its effect signatures (no
+  // hand-written `dts`). Cached by path+mtime, so this only rebuilds a TS Program
+  // when a tool file actually changes.
+  const derivedDts = deriveCapabilityDts(scanned.map((f) => ({ path: f.path, modifiedAt: f.modifiedAt })))
 
   const entries: CapabilityCatalogEntry[] = []
   const modules = new Map<string, Capability>()
@@ -99,7 +104,8 @@ export async function loadCapabilities(env: NodeJS.ProcessEnv = process.env): Pr
       entry.secrets = cap.secrets
       entry.secretStatus = computeSecretStatus(cap.secrets, env)
       entry.methods = Object.keys(cap.effects)
-      entry.dts = cap.dts ?? ''
+      // Namespace types are derived from the effect signatures, not hand-written.
+      entry.dts = derivedDts.get(file.path) ?? ''
 
       modules.set(file.name, cap)
     } catch (err) {

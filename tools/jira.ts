@@ -16,5 +16,4 @@ export default defineCapability({
       return { key: args.key, acceptanceCriteria: j.fields?.customfield_ac ?? [] }
     },
   },
-  dts: `getTicket(args: { key: string }): Promise<{ key: string; acceptanceCriteria: string[] } | null>;`,
 })

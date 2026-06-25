@@ -29,14 +29,13 @@ export interface Capability {
   secrets: string[]
   /** Effect functions, keyed by method name -> jira.getTicket etc. */
   effects: Record<string, EffectFn>
-  /** Optional hand-written ambient .d.ts body for the namespace's methods.
-   *  Absent => loose typing (declare const <name>: Record<string, (args:any)=>Promise<any>>). */
-  dts?: string
 }
 
 /** Identity helper that preserves inference and validates shape at author time.
  *  Pure: callable in either realm; the HOST imports the module for real. */
-export function defineCapability<C extends Capability>(cap: C): C {
+export function defineCapability<E extends Record<string, EffectFn>>(
+  cap: { name: string; secrets: string[]; effects: E },
+): { name: string; secrets: string[]; effects: E } {
   if (!cap.name || !/^[A-Za-z_$][\w$]*$/.test(cap.name)) {
     throw new Error(`defineCapability: invalid namespace name "${cap.name}"`)
   }
