@@ -42,14 +42,15 @@ export interface Capability {
   secrets: string[]
   /** Effect functions, keyed by method name -> jira.getTicket etc. */
   effects: Record<string, EffectFn>
-  /** Optional hand-written ambient .d.ts body for the namespace's methods.
-   *  Absent => loose typing (declare const <name>: Record<string, (args:any)=>Promise<any>>). */
-  dts?: string
 }
 
 /** Identity helper that preserves inference and validates shape at author time.
- *  Pure: callable in either realm; the HOST imports the module for real. */
-export function defineCapability<C extends Capability>(cap: C): C {
+ *  Pure: callable in either realm; the HOST imports the module for real.
+ *  `effects` is captured as its own generic so per-effect signatures are NOT
+ *  widened to the index signature — the namespace .d.ts is derived from them. */
+export function defineCapability<E extends Record<string, EffectFn>>(
+  cap: { name: string; secrets: string[]; effects: E },
+): { name: string; secrets: string[]; effects: E } {
   if (!cap.name || !/^[A-Za-z_$][\w$]*$/.test(cap.name)) {
     throw new Error(`defineCapability: invalid namespace name "${cap.name}"`)
   }
@@ -225,7 +226,8 @@ export interface CapabilityCatalogEntry {
   secretStatus: Record<string, { present: boolean }>
   /** Effect method names (for the palette / hovers). */
   methods: string[]
-  /** Hand-written ambient `declare const <name>: { ... }` body, or '' for loose. */
+  /** Ambient `declare const <name>: { ... }` body, derived server-side from the
+   *  effect signatures (server/workflow/derive-capability-dts.ts); '' for loose. */
   dts: string
   /** Absolute source path (for "open in editor"). */
   path: string
@@ -400,11 +402,12 @@ export default defineCapability({
       return { key: args.key, acceptanceCriteria: j.fields.customfield_ac ?? [] }
     },
   },
-  dts: `getTicket(args: { key: string }): Promise<{ key: string; acceptanceCriteria: string[] } | null>;`,
 })
 ```
 
-**`tools/gitlab.ts`** (project-tier capability — abbreviated): `name: 'gitlab'`, `secrets: ['GITLAB_TOKEN','GITLAB_BASE_URL']`, effects `getMrComments(ctx,{ project, mr })` and `getMrDiff(ctx,{ project, mr })`, each returning JSON-serializable shapes, with a matching `dts`.
+The injected-namespace `.d.ts` (`jira.getTicket(args: { key: string }): Promise<{ key: string; acceptanceCriteria: string[] } | null>`) is **derived from this effect's signature** at load time — no hand-written `dts` (see §6 In).
+
+**`tools/gitlab.ts`** (project-tier capability — abbreviated): `name: 'gitlab'`, `secrets: ['GITLAB_TOKEN','GITLAB_BASE_URL']`, effects `getMrComments(ctx,{ project, mr })` and `getMrDiff(ctx,{ project, mr })`, each returning JSON-serializable shapes.
 
 **`tools/git.ts`** (project-tier capability): `name: 'git'`, `secrets: []`, effect `checkoutWorktree(ctx, { repo, ref })` returning `{ worktree: string }` (host-side `git worktree add` into a temp dir).
 
@@ -473,13 +476,14 @@ This seed exercises all four hard-blocker fixes simultaneously: top-level `await
 - Capability `declare const <ns>` dts scoped by `meta.capabilities`, dynamically re-injected.
 - Pure-helper inlining transform replacing esbuild; determinism prelude + IIFE + return-capture + source-line mapping preserved.
 - `GET /api/capabilities`, `fetchCapabilities()`, two IDE tool-file sections, Secrets/Capabilities run panels.
+- **Auto-derived namespace types** — each capability's `declare const <ns>: { … }` is derived from the effect function signatures via the TS compiler API (`server/workflow/derive-capability-dts.ts`): a synthetic module applies an `InjectedNamespace` mapped type that drops `ctx` and wraps every return in `Promise<Awaited<R>>`; the checker prints the structural type. Cached by path+mtime. No hand-written `dts`.
+- **Tool-file editing in the IDE** — capability `.ts` modules open/edit/save in the Monaco editor (`GET`/`PUT /api/tools/:tier/:name`), with the relative `../shared/capability.ts` import resolved to real types in-editor.
 
 **Out (deferred — seams left, not built):**
 - Durable replay journal (effects are recorded/journaled, not replayed; `callIndex` keys the future read-side).
 - MCP-as-capability unification.
 - npm-pack/published-signed third tier (the "Shared tools" mount is the seed catalog).
 - Keychain/encrypted secret storage + any UI secret entry (presence booleans only, ever).
-- Automatic TS-type extraction from capability modules (hand-written `dts` per capability for MVP; absent ⇒ loose typing).
 - Capability side-effect sandboxing / network allowlists beyond `MAX_EFFECTS_PER_RUN` + `this.aborted`.
 
 ## 7. Open issues / risks

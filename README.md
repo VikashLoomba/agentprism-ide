@@ -22,6 +22,8 @@ Dynamic workflows are powerful, but normally the *agent* writes the orchestratio
 - **Breakpoints & stepping** — click the gutter to set a breakpoint on an `agent()` line; execution pauses *after* that call resolves so you can inspect its output, then **Resume** or **Step**. Works even for agents nested inside `parallel()` thunks (line mapping via V8 stack traces).
 - **Phase / agent run tree** — every agent shows its status, per‑call `config` (model/mode/effort/…), streaming message, thinking, tool calls, structured result, tokens, and errors.
 - **ACP event console** — a terminal‑style log of spawns, tool calls, plans, permission requests, mode changes, and agent stderr.
+- **Capabilities** — give workflows *world‑touching* powers without leaving the sandbox: declare `meta.capabilities: ['jira', …]` and call host‑injected namespaces (`await jira.getTicket({ key })`). Each call is a **deterministic, recorded effect** run in a trusted host realm; the workflow only ever sees `(args) => Promise<result>`, and recoverable failures resolve to `null`. **Namespace types are auto‑derived** from the tool's effect signatures, so `jira.getTicket(...)` is fully typed in the editor — no hand‑written `.d.ts`. Capabilities live in project `tools/` and a user `~/.agentprism/tools/` library (project shadows user), declare their **secret names** only (presence shown in the run panel; values never stored), and are editable as `.ts` files right in the IDE.
+- **Prompt templates** — assemble prompts deterministically: author Handlebars `.hbs` templates with a typed **frontmatter param schema**, opened in a "Prompts" sidebar with Monaco highlighting and a **live preview** rendered identically to production. Call them in a workflow as `prompts.<name>(data)` — a pure, typed `string`‑returning helper. Two tiers (`prompts/` + `~/.agentprism/prompts/`), with built‑in safe helpers (`eq`, `join`, `json`, …) and partials for composition.
 - **Local files** — save/load workflows as `.js` files in `workflows/`.
 
 ## Architecture
@@ -128,6 +130,7 @@ Key globals (full types power editor intellisense — see `src/lib/workflow-dts.
 - `pipeline(items, ...stages)` — fan each item through sequential stages; items run concurrently.
 - `phase(title)`, `log(msg)`, `args`, `cwd`, `budget`.
 - Quality helpers: `verify`, `judgePanel`, `loopUntilDry`, `completenessCheck`, `retry`, `gate`.
+- **Capability namespaces** — anything in `meta.capabilities` is injected as a global (`await jira.getTicket({ key })`), typed from the tool's effect signatures. **Prompts** — `prompts.<name>(data)` renders a scoped `.hbs` template to a string (declare them in `meta.prompts`).
 
 `opts.agent` selects which connected backend runs the call (`'claude' | 'codex'`); omitting it falls back to the run‑config **default agent**. `opts.config` is a per‑call ACP **session config** object — its keys are the [Session Config Options](https://agentclientprotocol.com/protocol/v1/session-config-options) that backend advertises, applied to its ACP session via `session/set_config_option` before the prompt. The options are **agent‑specific**, narrowed in‑editor on `opts.agent` and validated against it:
 
@@ -139,11 +142,15 @@ Example workflows live in `workflows/` (`auth_audit.js`, `codebase_review.js`, `
 ## Project layout
 
 ```
-shared/      DSL types, run-event model, WS/REST protocol, the validator (browser + server)
-server/      Express + ws, ACP connection, vm executor, run orchestration, file store
-src/         React app: Monaco editor, meta form, file browser, run tree, ACP log, store
+shared/      DSL types, run-event model, WS/REST protocol, capability + prompt env, the validator (browser + server)
+server/      Express + ws, ACP connection, vm executor, capability/prompt loaders, run orchestration, file store
+src/         React app: Monaco editor, meta form, file browser, run tree, ACP log, Handlebars preview, store
 workflows/   Saved workflow .js files
+tools/       Capability modules (world-touching effects) + pure helpers, imported host-side
+prompts/     Handlebars (.hbs) prompt templates with typed frontmatter params
 ```
+
+A user-level library at `~/.agentprism/tools/` and `~/.agentprism/prompts/` is merged in as a second tier ("Shared tools" / "Shared prompts"); project entries shadow user entries of the same name.
 
 ## Notes & limitations
 
