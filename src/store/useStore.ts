@@ -969,6 +969,7 @@ export const useStore = create<State>((set, get) => {
             s.capabilityCatalog,
             s.promptCatalog,
           )
+          const activeStillValid = msg.workspaces.some((w) => w.id === s.activeWorkspaceId)
           set({
             agents: msg.agents,
             workspaces: msg.workspaces,
@@ -983,6 +984,20 @@ export const useStore = create<State>((set, get) => {
             validation,
             ...inputStatePatch(validation.meta?.inputs, s.validation.meta?.inputs, s.inputValues),
           })
+          // Active ws vanished across a reconnect (e.g. a pruned persisted root that was
+          // active): repoint to the new default and refetch its catalogs/files. `set` above
+          // left `activeWorkspaceId` unchanged, so setActiveWorkspace sees a real prev→next
+          // delta (it early‑returns only when prev === next).
+          //
+          // Gate on an already-established active id: an empty `activeWorkspaceId` is not a
+          // vanished workspace, it is the pre-init state. On first page load `hello` can race
+          // ahead of `init()`'s localStorage hydration (the WS connects synchronously, before
+          // init's awaited HTTP fetch resolves), so reconciling an empty active here would
+          // clobber the user's persisted selection with the default. Leave the uninitialized
+          // case for init() to own.
+          if (s.activeWorkspaceId && !activeStillValid && msg.defaultWorkspaceId) {
+            void get().setActiveWorkspace(msg.defaultWorkspaceId)
+          }
           break
         }
         case 'snapshot': {

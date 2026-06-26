@@ -173,8 +173,8 @@ export function WorkflowEditor() {
   }, [activeWorkspaceId])
 
   // A tool .ts buffer gets a real file:// model URI so the editor's TS service can
-  // resolve its relative `../shared/capability.ts` import against the injected cap
-  // lib (full intellisense, no phantom "cannot find module"). Workflow/prompt
+  // resolve its `agentprism/capability` import against the injected virtual cap
+  // package (full intellisense, no phantom "cannot find module"). Workflow/prompt
   // buffers stay on the default single reused model — preserving the R3 stale-
   // annotation clearing that relies on one model across the language flip.
   const modelPath =

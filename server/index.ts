@@ -7,7 +7,7 @@ import { createRuntime } from '../runtime/index.ts'
 import { createServer } from './factory.ts'
 import { PORT } from './config.ts'
 
-const runtime = createRuntime()
+const runtime = createRuntime({ persistWorkspaces: true })
 const { listen } = createServer(runtime)
 
 // listen() prints the startup banner (port, WS url, default work dir, installed

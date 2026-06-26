@@ -86,7 +86,7 @@ async function main() {
   const { createServer } = await import(pathToFileURL(factoryEntry).href)
   const { createRuntime } = await import(pathToFileURL(runtimeEntry).href)
 
-  const runtime = createRuntime({ workspaces: [root, ...extraRoots] })
+  const runtime = createRuntime({ workspaces: [root, ...extraRoots], persistWorkspaces: true })
   const server = createServer(runtime)
   server.listen(port)
 }

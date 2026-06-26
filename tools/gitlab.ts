@@ -1,5 +1,5 @@
 // tools/gitlab.ts
-import { defineCapability } from '../shared/capability.ts'
+import { defineCapability } from 'agentprism/capability'
 
 export default defineCapability({
   name: 'gitlab',

@@ -55,6 +55,9 @@ export const USER_TOOLS_DIR = path.join(HOME, '.agentprism', 'tools')
 /** User-level prompt-template (.hbs) dir ("Shared prompts" tier). */
 export const USER_PROMPTS_DIR = path.join(HOME, '.agentprism', 'prompts')
 
+/** Persisted list of dynamically‑added (non‑default) workspace roots (P1‑B). */
+export const USER_WORKSPACES_FILE = path.join(HOME, '.agentprism', 'workspaces.json')
+
 export interface DerivedDirs {
   root: string
   tools: string

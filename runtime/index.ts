@@ -6,6 +6,7 @@
 // receiving the full event stream and the mid-run interaction round-trips. The
 // IDE's WS/HTTP server is just another consumer of this exact API — ONE engine.
 import { createWorkspaceRegistry } from './workspace-registry.ts'
+import { loadPersistedRoots, savePersistedRoots, canonicalKey } from './workspace-store.ts'
 import { listAgents } from './agents.ts'
 import type { WorkflowRef } from './resolve.ts'
 import type { RunHandle, RunOptions, RunResult } from './run-controller.ts'
@@ -22,6 +23,11 @@ export interface RuntimeOptions {
   cwd?: string
   /** Registry-wide default env. Defaults to process.env; never serialized. */
   env?: NodeJS.ProcessEnv
+  /** IDE‑only opt‑in: restore + persist non‑default workspace roots to
+   *  ~/.agentprism/workspaces.json (keyed by the default root). Default false —
+   *  the programmatic embed never reads or writes that file. Set true ONLY in the
+   *  two IDE entrypoints (server/index.ts, bin/agentprism-ide.mjs). */
+  persistWorkspaces?: boolean
 }
 
 export interface Runtime {
@@ -40,8 +46,35 @@ export interface Runtime {
 
 export function createRuntime(options: RuntimeOptions = {}): Runtime {
   const env = options.env ?? process.env
-  const registry = createWorkspaceRegistry({ env })
+  const persistEnabled = options.persistWorkspaces === true
 
+  // Suppress per‑open persistence writes during boot; persist once after restore.
+  // `defaultRoot` is the FIXED persistence key, captured after the first open below and
+  // NEVER reassigned — even if the registry later promotes a different default on close.
+  let restoring = true
+  let defaultRoot = ''
+  // Persist every open root EXCEPT the fixed boot default (it is the key, re‑derived from
+  // cwd each boot). Filtering here — against `defaultRoot`, not the registry's mutable
+  // `defaultId` — is what keeps a promoted‑on‑close root in the persisted set. `onChange`
+  // already passes ALL open roots; we drop the boot default here.
+  const persistNonDefault = (allOpenRoots: string[]) => {
+    savePersistedRoots(
+      defaultRoot,
+      allOpenRoots.filter((r) => canonicalKey(r) !== canonicalKey(defaultRoot)),
+    )
+  }
+  const registry = createWorkspaceRegistry({
+    env,
+    // When persistence is off, pass NO callback at all → the registry's open/close
+    // are fully inert w.r.t. the filesystem (programmatic embed / runWorkflow).
+    onChange: persistEnabled
+      ? (allOpenRoots) => {
+          if (!restoring) persistNonDefault(allOpenRoots)
+        }
+      : undefined,
+  })
+
+  // 1. Open the provided roots (first = default) or the back‑compat cwd default.
   if (options.workspaces && options.workspaces.length > 0) {
     for (const w of options.workspaces) {
       if (typeof w === 'string') registry.open(w)
@@ -51,6 +84,29 @@ export function createRuntime(options: RuntimeOptions = {}): Runtime {
     // Back-compat: a single default workspace at cwd ?? process.cwd(). This is the
     // SOLE permitted process.cwd() reader in the runtime (composition-root default).
     registry.open(options.cwd ?? process.cwd(), { useEnvDirOverrides: true })
+  }
+  defaultRoot = registry.default().root
+
+  // 2. IDE‑only: restore previously‑added (non‑default) roots for THIS default root,
+  //    on top of the provided set. open() dedups by workspace id, so a persisted root
+  //    that equals the default (or any already‑open root) is a harmless no‑op.
+  if (persistEnabled) {
+    for (const root of loadPersistedRoots(defaultRoot)) {
+      try {
+        registry.open(root)
+      } catch {
+        /* skip unreadable/missing root */
+      }
+    }
+  }
+
+  restoring = false
+  // 3. IDE‑only: one authoritative write of the surviving set under the FIXED boot
+  //    default‑root key (prunes dead roots, captures CLI --workspace additions). Filter by
+  //    the boot `defaultRoot` — NOT `w.isDefault` — so this stays consistent with the
+  //    onChange path and with the key even after an in‑session default reassignment.
+  if (persistEnabled) {
+    persistNonDefault(registry.list().map((w) => w.root))
   }
 
   return {

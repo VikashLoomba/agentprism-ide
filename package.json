@@ -15,7 +15,8 @@
     "./server": {
       "types": "./dist-lib/server/factory.d.ts",
       "import": "./dist-lib/server/factory.js"
-    }
+    },
+    "./capability": "./shared/capability.ts"
   },
   "files": [
     "dist",
@@ -31,7 +32,7 @@
   "scripts": {
     "dev": "concurrently -k -n web,server -c magenta,cyan \"npm:dev:web\" \"npm:dev:server\"",
     "dev:web": "vite",
-    "dev:server": "tsx watch server/index.ts",
+    "dev:server": "tsx watch --exclude \"**/.agentprism/**\" --exclude \"**/node_modules/**\" server/index.ts",
     "build": "tsc -b && vite build && npm run build:lib",
     "build:lib": "tsc -p tsconfig.lib.json",
     "start": "node --import tsx server/index.ts",

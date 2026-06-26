@@ -63,30 +63,50 @@ export function WorkspacePicker() {
           <SelectValue placeholder="Workspace" />
         </SelectTrigger>
         <SelectContent>
-          {workspaces.map((w) => (
-            <SelectItem key={w.id} value={w.id} className="pr-2">
-              <span className="flex min-w-0 items-center gap-2" title={w.root}>
-                <StatusDot status={attention[w.id]?.status ?? 'idle'} />
-                <span className="truncate">{w.name}</span>
-                {w.id !== activeWorkspaceId && (
-                  <button
-                    type="button"
-                    aria-label={`Close ${w.name}`}
-                    disabled={workspaces.length === 1}
-                    onPointerDown={(e) => e.stopPropagation()}
-                    onClick={(e) => {
-                      e.preventDefault()
-                      e.stopPropagation()
-                      void closeWorkspace(w.id)
-                    }}
-                    className="ml-1 rounded p-0.5 text-muted-foreground hover:bg-accent hover:text-foreground disabled:opacity-40"
-                  >
-                    <X className="size-3" />
-                  </button>
-                )}
-              </span>
-            </SelectItem>
-          ))}
+          {workspaces.map((w) => {
+            const isActive = w.id === activeWorkspaceId
+            const canClose = !isActive && workspaces.length > 1
+            return (
+              <SelectItem
+                key={w.id}
+                value={w.id}
+                className="pr-2"
+                aria-keyshortcuts={canClose ? 'Delete' : undefined}
+                onKeyDown={
+                  canClose
+                    ? (e) => {
+                        if (e.key === 'Delete' || e.key === 'Backspace') {
+                          e.preventDefault()
+                          void closeWorkspace(w.id)
+                        }
+                      }
+                    : undefined
+                }
+              >
+                <span className="flex min-w-0 items-center gap-2" title={w.root}>
+                  <StatusDot status={attention[w.id]?.status ?? 'idle'} />
+                  <span className="truncate">{w.name}</span>
+                  {!isActive && (
+                    <button
+                      type="button"
+                      aria-label={`Close ${w.name}`}
+                      disabled={workspaces.length === 1}
+                      onPointerDown={(e) => e.stopPropagation()}
+                      onPointerUp={(e) => e.stopPropagation()}
+                      onClick={(e) => {
+                        e.preventDefault()
+                        e.stopPropagation()
+                        void closeWorkspace(w.id)
+                      }}
+                      className="ml-1 rounded p-0.5 text-muted-foreground hover:bg-accent hover:text-foreground disabled:opacity-40"
+                    >
+                      <X className="size-3" />
+                    </button>
+                  )}
+                </span>
+              </SelectItem>
+            )
+          })}
           <SelectSeparator />
           <SelectItem value={OPEN_SENTINEL}>
             <span className="flex items-center gap-2">

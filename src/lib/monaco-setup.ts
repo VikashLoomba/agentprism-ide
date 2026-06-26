@@ -6,20 +6,14 @@ import type { Uri } from 'monaco-editor'
 // "no highlighting" bug for the prompt-template live editor.
 import 'monaco-editor/esm/vs/basic-languages/handlebars/handlebars.contribution'
 // The real source of shared/capability.ts, injected into the TS service as a
-// virtual file so a tool module's `import { defineCapability } from
-// '../shared/capability.ts'` resolves to its actual types (full intellisense)
-// instead of squiggling as an unresolved module.
+// virtual `node_modules/agentprism` package so a tool module's
+// `import { defineCapability } from 'agentprism/capability'` resolves to its
+// actual types (full intellisense) instead of squiggling as an unresolved module.
 import capabilitySource from '@shared/capability.ts?raw'
 import { INITIAL_WORKFLOW_DSL_DTS } from './workflow-dts'
 import { fetchToolSources, fetchToolTypes } from './api'
 
 const WORKFLOW_DTS_FILE_PATH = 'ts:agentprism-workflow-globals.d.ts'
-// The cap lib is namespaced per ACTIVE workspace: `file:///<wsId>/shared/capability.ts`.
-// A tool buffer gets the model URI `file:///<wsId>/tools/<name>.ts`, so its relative
-// `../shared/capability.ts` import resolves exactly there (§2.4).
-function capabilityLibPath(wsId: string): string {
-  return `file:///${wsId}/shared/capability.ts`
-}
 const NODE_SHIM_FILE_PATH = 'ts:agentprism-node-shim.d.ts'
 // Tool modules may `import { execFile } from 'node:child_process'` etc. Rather
 // than ship all of @types/node into the browser editor, declare node:* as a
@@ -150,12 +144,28 @@ export function configureMonaco(monaco: Monaco): void {
 
 /**
  * The always-present libs for tool buffers, namespaced by the ACTIVE workspace:
- * the real capability source (so `defineCapability` is typed) at the workspace's
- * cap-lib path, and the (ws-independent) node:* shim.
+ * a virtual `node_modules/agentprism` package (its `package.json` exports
+ * `./capability` → `./capability.ts`, whose content is the real capability source
+ * so `defineCapability` is typed) and the (ws-independent) node:* shim. A tool
+ * buffer's model URI is `file:///<wsId>/tools/<name>.ts`, so Monaco's Bundler
+ * resolution walks up to `file:///<wsId>/node_modules/agentprism` exactly like it
+ * resolves `zod/v4`.
  */
+function agentprismPkgJson(wsId: string): { content: string; filePath: string } {
+  return {
+    filePath: `file:///${wsId}/node_modules/agentprism/package.json`,
+    content: JSON.stringify({
+      name: 'agentprism',
+      version: '0.0.0',
+      type: 'module',
+      exports: { './capability': './capability.ts' },
+    }),
+  }
+}
 function baseToolLibs(wsId: string): { content: string; filePath: string }[] {
   return [
-    { content: capabilitySource, filePath: capabilityLibPath(wsId) },
+    agentprismPkgJson(wsId),
+    { content: capabilitySource, filePath: `file:///${wsId}/node_modules/agentprism/capability.ts` },
     { content: NODE_SHIM_DTS, filePath: NODE_SHIM_FILE_PATH },
   ]
 }

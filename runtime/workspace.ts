@@ -156,47 +156,109 @@ export function canonicalizeRoot(root: string): string {
 }
 
 // ---------------------------------------------------------------------------
-// Capability-API shim (§5.4) — the load-bearing runtime fix
+// Capability-API shim (P1-C) — the load-bearing runtime fix
 // ---------------------------------------------------------------------------
+//
+// Tools import the collision-proof bare specifier `agentprism/capability`. It
+// resolves in three ways, all backed by REAL on-disk artifacts written here:
+//   - Default / package-root workspace: Node self-references the package's own
+//     `exports['./capability']` (package.json) — NO shim written.
+//   - External workspace: a generated, sentinel-guarded `node_modules/agentprism`
+//     shim package under the root re-exports PACKAGE_ROOT's capability source;
+//     standard Node resolution from `<root>/tools/foo.ts` walks up to it. The
+//     shim lives under `node_modules/` (gitignored), so the user's source tree is
+//     never polluted. A REAL installed `agentprism` (sentinel absent) is detected
+//     and left intact so its `./capability` export resolves natively.
+//   - User-tier tools: `~/.agentprism/node_modules/agentprism`, resolvable from
+//     `~/.agentprism/tools/foo.ts`.
+// Any pre-existing `<root>/shared/capability.ts` left by the prior project-tree
+// shim is now INERT (nothing imports it) and is intentionally left in place —
+// removing files from the user's tree is out of scope.
 
+const SHIM_MARKER = '_agentprismShim'
 const SHIM_SENTINEL = '// @agentprism-capability-shim (generated; safe to delete)'
 
-/** Ensure `<root>/shared/capability.ts` exists and re-exports AgentPrism's API,
- *  so a tool's on-disk `../shared/capability.ts` import resolves at runtime to
- *  the PACKAGE_ROOT source (§0). Idempotent; no-op when `<root>/shared` already
- *  IS PACKAGE_ROOT's (ws == package); never clobbers a user's own non-shim file. */
-function ensureCapabilityShimAt(root: string): void {
-  const pkgCap = path.join(PACKAGE_ROOT, 'shared', 'capability.ts')
-  const cap = path.join(root, 'shared', 'capability.ts')
-  // root == package (default single-workspace / back-compat): leave it untouched.
-  try {
-    if (fs.realpathSync.native(cap) === fs.realpathSync.native(pkgCap)) return
-  } catch {
-    /* cap absent — fall through to write */
-  }
-  // A user file that is NOT our shim shadows the API on purpose: do not overwrite.
-  if (fs.existsSync(cap)) {
-    const head = fs.readFileSync(cap, 'utf8').slice(0, SHIM_SENTINEL.length)
-    if (head !== SHIM_SENTINEL) {
-      console.warn(`[agentprism] ${cap} exists and is not a generated shim; leaving as-is`)
-      return
-    }
-  }
-  fs.mkdirSync(path.dirname(cap), { recursive: true })
-  // Re-export from PACKAGE_ROOT by relative specifier (portable; tsx-loadable).
-  const spec = path.relative(path.dirname(cap), pkgCap).split(path.sep).join('/')
-  const rel = spec.startsWith('.') ? spec : `./${spec}`
-  fs.writeFileSync(cap, `${SHIM_SENTINEL}\nexport * from ${JSON.stringify(rel)}\n`)
+/** Forward-slashed, `./`-prefixed relative specifier from a generated shim package
+ *  dir to PACKAGE_ROOT's capability source (portable; tsx-loadable). */
+function capabilityRelSpecifier(pkgDir: string): string {
+  const target = path.join(PACKAGE_ROOT, 'shared', 'capability.ts')
+  const spec = path.relative(pkgDir, target).split(path.sep).join('/')
+  return spec.startsWith('.') ? spec : `./${spec}`
 }
 
-/** Project-tier shim (the workspace root). */
-function ensureCapabilityShim(root: string): void {
-  ensureCapabilityShimAt(root)
+/** True when a pre-existing `<parent>/node_modules/agentprism/package.json` is
+ *  FOREIGN (a real install or a user file) and must be left intact. A missing file
+ *  (→ ours to write) is false; an unparseable file is treated as foreign (true). */
+function agentprismShimIsForeign(parent: string): boolean {
+  const pkgJson = path.join(parent, 'node_modules', 'agentprism', 'package.json')
+  let raw: string
+  try {
+    raw = fs.readFileSync(pkgJson, 'utf8')
+  } catch {
+    return false // absent → ours to write
+  }
+  try {
+    const parsed = JSON.parse(raw) as Record<string, unknown>
+    return parsed[SHIM_MARKER] !== true
+  } catch {
+    return true // unparseable → foreign, leave as-is
+  }
+}
+
+/** (Re)write a `node_modules/agentprism` shim package under `parent` that re-exports
+ *  PACKAGE_ROOT's capability API, so a bare `agentprism/capability` import resolves
+ *  there via standard Node resolution. Always rewrites when we own it (cheap; self-
+ *  heals a moved PACKAGE_ROOT). The mkdir + both writes are best-effort: a read-only /
+ *  full / permission-denied root must NOT fail the whole workspace open — it degrades
+ *  to a per-module loadError (capability-loader captures it), which also keeps P1-B
+ *  from pruning the root on a transient write failure. */
+function writeAgentprismShim(parent: string): void {
+  const pkgDir = path.join(parent, 'node_modules', 'agentprism')
+  const rel = capabilityRelSpecifier(pkgDir)
+  try {
+    fs.mkdirSync(pkgDir, { recursive: true })
+    fs.writeFileSync(
+      path.join(pkgDir, 'package.json'),
+      JSON.stringify(
+        {
+          name: 'agentprism',
+          version: '0.0.0-agentprism-shim',
+          type: 'module',
+          exports: { './capability': './capability.ts' },
+          [SHIM_MARKER]: true,
+        },
+        null,
+        2,
+      ),
+    )
+    fs.writeFileSync(
+      path.join(pkgDir, 'capability.ts'),
+      `${SHIM_SENTINEL}\nexport * from ${JSON.stringify(rel)}\n`,
+    )
+  } catch {
+    /* best-effort: shim is a convenience; the tool degrades to a per-module loadError */
+  }
+}
+
+/** Project-tier shim: write `<root>/node_modules/agentprism` for an EXTERNAL
+ *  workspace. The in-repo / package-root workspace self-references the package's own
+ *  `exports['./capability']` and gets NO shim, so it is skipped. A real installed
+ *  `agentprism` (sentinel absent) is left intact.
+ *  ORDERING INVARIANT (P1-C): this runs synchronously inside createWorkspace →
+ *  registry.open(), BEFORE loadCapabilities → deriveCapabilityDts, so the on-disk
+ *  artifact that BOTH the dts Program and the Node `import()` resolve through is
+ *  guaranteed present when those run. */
+function ensureAgentprismPackageShim(root: string): void {
+  if (canonicalizeRoot(root) === canonicalizeRoot(PACKAGE_ROOT)) return
+  if (agentprismShimIsForeign(root)) return
+  writeAgentprismShim(root)
 }
 
 /** User-tier shim (~/.agentprism). Written only when the user tools dir actually
- *  holds capability files. Idempotent + process-global; a no-op after the first. */
-function ensureUserCapabilityShim(): void {
+ *  holds capability files, so `~/.agentprism/tools/foo.ts` resolves the bare
+ *  specifier via `~/.agentprism/node_modules/agentprism`. Idempotent + process-
+ *  global; a real installed `agentprism` (sentinel absent) is left intact. */
+function ensureUserAgentprismShim(): void {
   let hasUserCaps = false
   try {
     hasUserCaps = fs.readdirSync(USER_TOOLS_DIR).some((f) => /\.(ts|mts|js|mjs)$/.test(f))
@@ -204,7 +266,9 @@ function ensureUserCapabilityShim(): void {
     /* USER_TOOLS_DIR absent → no user library → nothing to shim */
   }
   if (!hasUserCaps) return
-  ensureCapabilityShimAt(path.dirname(USER_TOOLS_DIR)) // ~/.agentprism
+  const userParent = path.dirname(USER_TOOLS_DIR) // ~/.agentprism
+  if (agentprismShimIsForeign(userParent)) return
+  writeAgentprismShim(userParent)
 }
 
 // ---------------------------------------------------------------------------
@@ -235,8 +299,8 @@ export function createWorkspace(root: string, opts: WorkspaceOpenOptions = {}): 
   const id = computeWorkspaceId(root)
   const env = opts.env ?? process.env
   const dirs = deriveWorkspaceDirs(root, { env, useEnvOverrides: opts.useEnvDirOverrides === true })
-  ensureCapabilityShim(dirs.root) // §5.4 (project tier)
-  ensureUserCapabilityShim() // §5.4 (user tier, idempotent across workspaces)
+  ensureAgentprismPackageShim(dirs.root) // P1-C (external project tier; package root self-refs)
+  ensureUserAgentprismShim() // P1-C (user tier, idempotent across workspaces)
   const capabilityDirs: readonly WorkspaceTier[] = [
     { dir: dirs.tools, tier: 'project' as const },
     { dir: USER_TOOLS_DIR, tier: 'user' as const },
@@ -262,7 +326,7 @@ export function createWorkspace(root: string, opts: WorkspaceOpenOptions = {}): 
     writeWorkflow: (n: string, c: string) => writeWorkflow(dirs.workflows, n, c),
     deleteWorkflow: (n: string) => deleteWorkflow(dirs.workflows, n),
     loadCapabilities: (e?: NodeJS.ProcessEnv) =>
-      loadCapabilities({ capabilityDirs, workspaceRoot: dirs.root, packageRoot: PACKAGE_ROOT, env: e ?? env }),
+      loadCapabilities({ capabilityDirs, workspaceRoot: dirs.root, env: e ?? env }),
     loadPrompts: () => loadPrompts(promptDirs),
     catalogs: async () => {
       const [c, p] = await Promise.all([ws.loadCapabilities(), ws.loadPrompts()])

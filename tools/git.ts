@@ -1,5 +1,5 @@
 // tools/git.ts
-import { defineCapability } from '../shared/capability.ts'
+import { defineCapability } from 'agentprism/capability'
 import { execFile } from 'node:child_process'
 import { mkdtemp } from 'node:fs/promises'
 import { tmpdir } from 'node:os'

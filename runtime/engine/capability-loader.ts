@@ -5,12 +5,10 @@
 // the whole catalog: per-module import/validation failures are captured as a
 // `loadError` string on the entry instead of throwing.
 
-import path from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { z } from 'zod'
 import { scanCapabilityFiles } from '../store/capabilities.ts'
 import { deriveCapabilityDts } from './derive-capability-dts.ts'
-import { USER_TOOLS_DIR } from '../paths.ts'
 import type { Capability, EffectFn } from '../../shared/capability.ts'
 import type { CapabilityCatalogEntry } from '../../shared/protocol.ts'
 import type { CapabilityCatalog } from '../../shared/capability-resolve.ts'
@@ -45,7 +43,6 @@ export interface LoadedCapabilities {
 export interface LoadCapabilitiesOptions {
   capabilityDirs: readonly { dir: string; tier: 'project' | 'user' }[]
   workspaceRoot: string
-  packageRoot: string
   env?: NodeJS.ProcessEnv
 }
 
@@ -79,11 +76,7 @@ export async function loadCapabilities(o: LoadCapabilitiesOptions): Promise<Load
   // rebuilds a TS Program when a tool file actually changes (§5.3).
   const derivedDts = deriveCapabilityDts(
     scanned.map((f) => ({ path: f.path, modifiedAt: f.modifiedAt })),
-    {
-      workspaceRoot: o.workspaceRoot,
-      packageRoot: o.packageRoot,
-      userToolsParent: path.dirname(USER_TOOLS_DIR),
-    },
+    { workspaceRoot: o.workspaceRoot },
   )
 
   const entries: CapabilityCatalogEntry[] = []

@@ -9,7 +9,9 @@ import { createWorkspace, computeWorkspaceId } from './workspace.ts'
 import type { Workspace, WorkspaceInfo, WorkspaceOpenOptions, WorkspaceRegistry } from './workspace.ts'
 import { evictCapabilityDtsCache } from './engine/derive-capability-dts.ts'
 
-export function createWorkspaceRegistry(opts: { env?: NodeJS.ProcessEnv } = {}): WorkspaceRegistry {
+export function createWorkspaceRegistry(
+  opts: { env?: NodeJS.ProcessEnv; onChange?: (allOpenRoots: string[]) => void } = {},
+): WorkspaceRegistry {
   const env = opts.env ?? process.env
   const map = new Map<string, Workspace>() // insertion order preserved
   let defaultId = ''
@@ -18,6 +20,14 @@ export function createWorkspaceRegistry(opts: { env?: NodeJS.ProcessEnv } = {}):
     const ws = map.get(id)
     if (!ws) throw new Error(`Unknown workspace: ${id}`)
     return ws
+  }
+
+  // Report EVERY currently‑open root — NOT filtered by defaultId. The default‑exclusion
+  // happens in createRuntime against the FIXED boot key, not here against the registry's
+  // mutable `defaultId` (the registry must not bake its reassignable default into the
+  // persisted set). The consumer only wires this when persistence is opted in.
+  const fireChange = () => {
+    opts.onChange?.([...map.values()].map((ws) => ws.root))
   }
 
   return {
@@ -30,6 +40,7 @@ export function createWorkspaceRegistry(opts: { env?: NodeJS.ProcessEnv } = {}):
       const useEnvDirOverrides = o.useEnvDirOverrides ?? id === defaultId
       const ws = createWorkspace(root, { env: o.env ?? env, useEnvDirOverrides })
       map.set(id, ws)
+      fireChange() // a new workspace was actually added (not the early existing path)
       return ws
     },
 
@@ -67,6 +78,8 @@ export function createWorkspaceRegistry(opts: { env?: NodeJS.ProcessEnv } = {}):
         defaultId = [...map.keys()].find((k) => k !== id)! // guaranteed: size > 1
       }
       map.delete(id)
+      fireChange() // including when the closed ws was the default — the consumer keys
+      // off the fixed boot default, so a reassignment here is inert downstream.
     },
   }
 }

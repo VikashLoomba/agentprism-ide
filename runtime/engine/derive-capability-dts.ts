@@ -7,7 +7,6 @@
 //     (ctx: CapabilityContext, args: A) => Promise<R> | R   ==>   (args: A) => Promise<Awaited<R>>
 // `checker.typeToString` then prints the fully-resolved structural object type.
 
-import fs from 'node:fs'
 import * as path from 'node:path'
 import * as ts from 'typescript'
 
@@ -18,21 +17,27 @@ export interface DerivableFile {
 }
 
 /** Anchors for the throwaway dts Program (§5.3). Every path derives from the
- *  workspace root + the AgentPrism package root — never from process.cwd(). */
+ *  workspace root — never from process.cwd(). The `agentprism/capability` bare
+ *  specifier in INJECT_SRC and in each tool resolves off REAL disk (PACKAGE_ROOT
+ *  self-ref for the default ws; the `<root>/node_modules/agentprism` shim for an
+ *  external ws), NOT via an injected overlay. Those on-disk artifacts are guaranteed
+ *  present here: createWorkspace writes the shims (ensureAgentprismPackageShim +
+ *  ensureUserAgentprismShim) synchronously during registry.open(), BEFORE
+ *  loadCapabilities → deriveCapabilityDts is ever invoked (the P1-C ordering
+ *  invariant). A virtual node_modules overlay does NOT work here (proven): the base
+ *  CompilerHost's directoryExists/realpath hit real disk and short-circuit the
+ *  node_modules probe for a dir not on disk, so overriding only getSourceFile/
+ *  fileExists/readFile is insufficient. */
 export interface DeriveDtsOptions {
   /** The owning workspace's root (anchors @types/node + npm resolution + cache key). */
   workspaceRoot: string
-  /** AgentPrism's install dir; its `shared/capability.ts` backs the cap-API overlay. */
-  packageRoot: string
-  /** `path.dirname(USER_TOOLS_DIR)` = `~/.agentprism` — the user-tier shim parent (B15). */
-  userToolsParent: string
 }
 
 const COMPILER_OPTIONS: ts.CompilerOptions = {
   target: ts.ScriptTarget.ES2022,
   module: ts.ModuleKind.ESNext,
   moduleResolution: ts.ModuleResolutionKind.Bundler,
-  allowImportingTsExtensions: true, // resolve the tools' `../shared/capability.ts` import
+  allowImportingTsExtensions: true, // resolve tools' sibling `.ts` imports + the shim's `./capability.ts`
   noEmit: true,
   strict: true,
   // Authors narrow `args` below EffectFn's `Json` param; under strictFunctionTypes
@@ -54,7 +59,7 @@ const TYPE_FLAGS = ts.TypeFormatFlags.NoTruncation | ts.TypeFormatFlags.InTypeAl
 // ctx-drop and the always-async Promise<Awaited<R>> wrap. Expand<> forces the
 // checker to print the structural object rather than `InjectedNamespace<…>`.
 const INJECT_SRC = `
-import type { CapabilityContext } from './shared/capability.ts'
+import type { CapabilityContext } from 'agentprism/capability'
 export type InjectedEffect<F> =
   F extends (ctx: CapabilityContext, args: infer A) => infer R ? (args: A) => Promise<Awaited<R>>
   : F extends (ctx: CapabilityContext) => infer R ? () => Promise<Awaited<R>>
@@ -81,9 +86,10 @@ function buildCheckSrc(files: DerivableFile[]): string {
   return lines.join('\n') + '\n'
 }
 
-/** Overlay CompilerHost: layers the synthetic files + the cap-API overlay over
- *  disk; node + @types + the .ts relative imports keep resolving through the
- *  unmodified base host, anchored at the workspace root. */
+/** Overlay CompilerHost: layers ONLY the synthetic inject + check files over disk;
+ *  node + @types + the `.ts` imports + the bare `agentprism/capability` specifier
+ *  keep resolving through the unmodified base host off REAL disk (the pre-written
+ *  node_modules shim / PACKAGE_ROOT self-ref), anchored at the workspace root. */
 function buildProgram(
   overlays: Map<string, string>,
   checkPath: string,
@@ -140,7 +146,7 @@ export function evictCapabilityDtsCache(workspaceRoot: string): void {
  * (pure helpers) yield an empty `{}` body, which is then skipped.
  */
 export function deriveCapabilityDts(files: DerivableFile[], opts: DeriveDtsOptions): Map<string, string> {
-  const { workspaceRoot, packageRoot, userToolsParent } = opts
+  const { workspaceRoot } = opts
   const sig = files
     .map((f) => `${f.path}:${f.modifiedAt}`)
     .sort()
@@ -153,22 +159,16 @@ export function deriveCapabilityDts(files: DerivableFile[], opts: DeriveDtsOptio
 
   const map = new Map<string, string>()
   if (files.length > 0) {
+    // ONLY the synthetic inject + check modules are overlaid. The bare specifier
+    // `agentprism/capability` (in INJECT_SRC and each tool) resolves off REAL disk
+    // through the pre-written node_modules shim / PACKAGE_ROOT self-ref (the P1-C
+    // ordering invariant guarantees those artifacts exist) — there is intentionally
+    // NO cap-API overlay here (a virtual node_modules overlay was proven not to
+    // resolve under this 3-method host).
     const overlays = new Map<string, string>([
       [injectPath, INJECT_SRC],
       [checkPath, buildCheckSrc(files)],
     ])
-    // The single AgentPrism-owned capability API source (§0). Overlaid at BOTH the
-    // workspace-relative path (project-tier tools + INJECT_SRC's `./shared/...`) AND
-    // the user-tier path (~/.agentprism/shared/...) so every tier's relative import
-    // resolves to PACKAGE_ROOT's source. Both overlays point at the ONE source.
-    try {
-      const capSrc = fs.readFileSync(path.join(packageRoot, 'shared', 'capability.ts'), 'utf8')
-      overlays.set(path.join(workspaceRoot, 'shared', 'capability.ts'), capSrc)
-      overlays.set(path.join(userToolsParent, 'shared', 'capability.ts'), capSrc)
-    } catch {
-      /* PACKAGE_ROOT cap source unreadable — fall through; imports squiggle but the
-         loader still degrades to the loose fallback dts per-file. */
-    }
     const { program, checker } = buildProgram(overlays, checkPath, workspaceRoot)
     const checkSf = program.getSourceFile(checkPath)
     if (checkSf) {

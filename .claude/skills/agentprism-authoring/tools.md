@@ -13,7 +13,7 @@ Both live in `tools/` (the **project tier**, resolved relative to the active **w
 
 ```ts
 // tools/jira.ts
-import { defineCapability } from '../shared/capability.ts'
+import { defineCapability } from 'agentprism/capability'
 
 export default defineCapability({
   name: 'jira',                          // namespace → workflows call `jira.<method>(args)`
@@ -31,6 +31,21 @@ export default defineCapability({
     },
   },
 })
+```
+
+`defineCapability` is imported from the bare specifier **`agentprism/capability`**. It resolves natively in the monorepo (the package self-references its own `./capability` export) and in any external workspace via a small generated `node_modules/agentprism` shim — nothing is written into your source tree.
+
+**No-import fallback (zero dependency).** `defineCapability` is purely an identity helper that exists for the types. If you don't want any import, export the same shape as a plain object — it loads identically and its namespace types are still auto-derived from the effect signatures:
+
+```ts
+// tools/jira.ts — no import needed
+export default {
+  name: 'jira',
+  secrets: ['JIRA_TOKEN'],
+  effects: {
+    async getTicket(ctx, args: { key: string }) { /* … */ return null },
+  },
+}
 ```
 
 Rules:
