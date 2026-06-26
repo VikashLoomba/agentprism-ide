@@ -30,8 +30,9 @@ import type { RequestPermissionResponse, SessionConfigOption, SessionUpdate } fr
 import { buildSandboxGlobals, runVm, type CheckpointOptions, type MethodConfigMap, type SandboxHost } from './executor.ts'
 import { instrumentWorkflow, sourceLineFromStack } from './instrument.ts'
 import { inlineHelpers } from './inline.ts'
-import { loadCapabilities, getCapabilityModules, type LoadedCapabilities } from './capability-loader.ts'
-import { loadPrompts, getPromptTemplates, type LoadedPrompts } from './prompt-loader.ts'
+import { getCapabilityModules, type LoadedCapabilities } from './capability-loader.ts'
+import { getPromptTemplates, type LoadedPrompts } from './prompt-loader.ts'
+import type { Workspace } from '../workspace.ts'
 import type { PromptTemplate } from '../../shared/prompt-template.ts'
 import type { PromptCatalog } from '../../shared/prompt-resolve.ts'
 import { AgentLimitError, NonRecoverableWorkflowError, TokenBudgetError, WorkflowAbortError, isNonRecoverable } from './errors.ts'
@@ -153,6 +154,8 @@ export class WorkflowRun {
   private stepMode: boolean
   /** Secret source for capabilities (default process.env); never serialized. */
   private env: NodeJS.ProcessEnv
+  /** The owning workspace — source of catalogs, tool dirs, and default cwd. */
+  private workspace: Workspace
   /** When true, checkpoint()/input() interactions park and await resolveInput
    *  (a UI subscriber or onInput handler is attached). When false (default),
    *  they resolve synchronously via the headless policy (opts.headless),
@@ -195,11 +198,12 @@ export class WorkflowRun {
   private pendingInputs = new Map<string, (response: InputResponse) => void>()
   private lastModesJson = ''
 
-  constructor(request: RunRequest, callbacks: RunCallbacks, opts: { env?: NodeJS.ProcessEnv } = {}) {
+  constructor(request: RunRequest, callbacks: RunCallbacks, opts: { env?: NodeJS.ProcessEnv; workspace: Workspace }) {
     this.runId = request.runId
     this.request = request
     this.callbacks = callbacks
     this.env = opts.env ?? process.env
+    this.workspace = opts.workspace
     this.cwd = request.cwd
     this.modeId = request.modeId
     this.autoApprove = !request.manualApprovals
@@ -787,7 +791,10 @@ export class WorkflowRun {
     }
     const v = validateWorkflow(script, this.request.agent, undefined, this.capabilityCatalog, this.promptCatalog)
     if (!v.ok) throw new Error('Nested workflow failed validation: ' + v.diagnostics.map((d) => d.message).join('; '))
-    const { source, headerBindings } = inlineHelpers(v.normalized)
+    const { source, headerBindings } = inlineHelpers(v.normalized, {
+      toolsDirs: this.workspace.capabilityDirs.map((d) => d.dir),
+      projectToolsDir: this.workspace.dirs.tools,
+    })
     const { code } = instrumentWorkflow(source, headerBindings)
     const globals = buildSandboxGlobals(this.hostHooks(args), this.resolveConfigs(v.meta, false))
     return runVm(code, globals)
@@ -863,7 +870,7 @@ export class WorkflowRun {
     // capability resolution gracefully rather than crashing the run.
     let loaded: LoadedCapabilities | undefined
     try {
-      loaded = await loadCapabilities(this.env)
+      loaded = await this.workspace.loadCapabilities(this.env)
       this.capabilityCatalog = loaded.catalog
     } catch (err) {
       this.logAcp('warn', 'capabilities', `Failed to load capabilities: ${err instanceof Error ? err.message : String(err)}`)
@@ -874,7 +881,7 @@ export class WorkflowRun {
     // undefined so validateWorkflow skips prompt resolution gracefully.
     let loadedPrompts: LoadedPrompts | undefined
     try {
-      loadedPrompts = await loadPrompts()
+      loadedPrompts = await this.workspace.loadPrompts()
       this.promptCatalog = loadedPrompts.catalog
     } catch (err) {
       this.logAcp('warn', 'prompts', `Failed to load prompts: ${err instanceof Error ? err.message : String(err)}`)
@@ -940,7 +947,10 @@ export class WorkflowRun {
     try {
       // Inline pure tools/ helpers into the header, THEN instrument; headerLines is
       // computed from the emitted prefix so the source-line mapping stays correct.
-      const { source, headerBindings } = inlineHelpers(validation.normalized)
+      const { source, headerBindings } = inlineHelpers(validation.normalized, {
+        toolsDirs: this.workspace.capabilityDirs.map((d) => d.dir),
+        projectToolsDir: this.workspace.dirs.tools,
+      })
       const { code, headerLines } = instrumentWorkflow(source, headerBindings)
       this.headerLines = headerLines
       const result = await runVm(code, buildSandboxGlobals(this.hostHooks(), this.methodConfigs))

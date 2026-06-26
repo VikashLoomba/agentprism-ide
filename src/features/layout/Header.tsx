@@ -4,6 +4,7 @@ import { useStore } from '@/store/useStore'
 import { Button } from '@/components/ui/button'
 import { Separator } from '@/components/ui/separator'
 import { StatusBadge } from './StatusBadge'
+import { WorkspacePicker } from '@/features/workspace/WorkspacePicker'
 import { cn } from '@/lib/utils'
 
 export function Header() {
@@ -48,6 +49,9 @@ export function Header() {
           <div className="text-[10px] uppercase tracking-wider text-muted-foreground">Dynamic Agent Workflows</div>
         </div>
       </div>
+
+      <Separator orientation="vertical" className="mx-1 !h-7" />
+      <WorkspacePicker />
 
       <Separator orientation="vertical" className="mx-1 !h-7" />
 

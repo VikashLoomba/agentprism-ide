@@ -2,7 +2,13 @@ import { useEffect, useRef } from 'react'
 import Editor, { type Monaco, type OnMount } from '@monaco-editor/react'
 import type { editor } from 'monaco-editor'
 import { useStore } from '@/store/useStore'
-import { configureMonaco, updateWorkflowDts, MONACO_THEME } from '@/lib/monaco-setup'
+import {
+  configureMonaco,
+  updateWorkflowDts,
+  refreshToolSources,
+  setActiveWorkspace as setMonacoActiveWorkspace,
+  MONACO_THEME,
+} from '@/lib/monaco-setup'
 
 export function WorkflowEditor() {
   const editorRef = useRef<editor.IStandaloneCodeEditor | null>(null)
@@ -19,6 +25,8 @@ export function WorkflowEditor() {
   const pauseLine = useStore((s) => s.run?.pause?.line)
   const toggleBreakpoint = useStore((s) => s.toggleBreakpoint)
   const setSource = useStore((s) => s.setSource)
+  const activeWorkspaceId = useStore((s) => s.activeWorkspaceId)
+  const prevWorkspaceId = useRef<string | null>(null)
 
   // A non-workflow file (.hbs prompt template or .ts tool module) is not a
   // workflow: acorn markers, breakpoint glyphs, pause decorations, and the
@@ -113,6 +121,16 @@ export function WorkflowEditor() {
     updateMarkers()
     updateBreakpoints()
     updatePause()
+    // Activate the current workspace's TS libs as soon as the worker exists (the
+    // activeWorkspaceId effect may have run before this onMount set the monaco ref).
+    if (activeWorkspaceId) {
+      setMonacoActiveWorkspace(mon, activeWorkspaceId)
+      prevWorkspaceId.current = activeWorkspaceId
+    }
+    // If a tool file is the first buffer (mounted before the effect's monaco ref
+    // was set), load its sibling/source libs here.
+    if (openKind === 'tool' && fileName)
+      void refreshToolSources(mon, activeWorkspaceId, `file:///${activeWorkspaceId}/tools/${fileName}`)
   }
 
   // On the workflow<->prompt flip, clear stale workflow annotations first (R3).
@@ -132,12 +150,35 @@ export function WorkflowEditor() {
   useEffect(updateBreakpoints, [breakpoints, openKind])
   useEffect(updatePause, [pauseLine, openKind])
 
+  // Tool-file intellisense: load the tool source files into the editor's virtual fs
+  // so sibling imports resolve (the runtime already loads them via `await import()`).
+  // npm package types are acquired reactively by the marker listener in
+  // configureMonaco — no buffer scanning here.
+  useEffect(() => {
+    const mon = monacoRef.current
+    if (!mon || openKind !== 'tool' || !fileName) return
+    void refreshToolSources(mon, activeWorkspaceId, `file:///${activeWorkspaceId}/tools/${fileName}`)
+  }, [openKind, fileName, activeWorkspaceId])
+
+  // WorkflowEditor OWNS the Monaco-side workspace switch (the store has no monaco
+  // ref). On activeWorkspaceId change — AFTER the store's state-only switch has
+  // repointed the buffer/catalog mirrors — swap the TS extra-libs to the new
+  // workspace and dispose the PREVIOUS workspace's tool models (§2.4 / WU-14).
+  useEffect(() => {
+    const mon = monacoRef.current
+    if (!mon || !activeWorkspaceId) return
+    if (prevWorkspaceId.current === activeWorkspaceId) return
+    prevWorkspaceId.current = activeWorkspaceId
+    setMonacoActiveWorkspace(mon, activeWorkspaceId)
+  }, [activeWorkspaceId])
+
   // A tool .ts buffer gets a real file:// model URI so the editor's TS service can
   // resolve its relative `../shared/capability.ts` import against the injected cap
   // lib (full intellisense, no phantom "cannot find module"). Workflow/prompt
   // buffers stay on the default single reused model — preserving the R3 stale-
   // annotation clearing that relies on one model across the language flip.
-  const modelPath = openKind === 'tool' && fileName ? `file:///tools/${fileName}` : undefined
+  const modelPath =
+    openKind === 'tool' && fileName ? `file:///${activeWorkspaceId}/tools/${fileName}` : undefined
 
   return (
     <Editor

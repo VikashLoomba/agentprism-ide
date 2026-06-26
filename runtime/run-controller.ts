@@ -12,9 +12,9 @@
 // RunHandle is a thin facade over a controller entry; the IDE WS adapter (UNIT C)
 // and headless hosts (UNIT E) both consume it.
 import { customAlphabet } from 'nanoid'
-import { WorkflowRun } from '../server/workflow/run.ts'
-import type { RunCallbacks } from '../server/workflow/run.ts'
-import { DEFAULT_CWD } from '../server/config.ts'
+import { WorkflowRun } from './engine/run.ts'
+import type { RunCallbacks } from './engine/run.ts'
+import type { Workspace } from './workspace.ts'
 import type { RunEvent, RunSnapshot, RunStats } from '../shared/events.ts'
 import type {
   InputRequest,
@@ -159,10 +159,12 @@ export class RunController {
   private runs = new Map<string, RunEntry>()
   private env: NodeJS.ProcessEnv
   private defaultCwd: string
+  private workspace: Workspace
 
-  constructor(opts: { env?: NodeJS.ProcessEnv; cwd?: string } = {}) {
+  constructor(opts: { env?: NodeJS.ProcessEnv; cwd?: string; workspace: Workspace }) {
     this.env = opts.env ?? process.env
-    this.defaultCwd = opts.cwd ?? DEFAULT_CWD
+    this.workspace = opts.workspace
+    this.defaultCwd = opts.cwd ?? opts.workspace.root
   }
 
   get(runId: string): RunHandle | undefined {
@@ -243,6 +245,7 @@ export class RunController {
       agent: entry.agent,
       modeId: options.modeId,
       cwd: entry.cwd,
+      workspaceId: this.workspace.id,
       args: prepared.args,
       breakpoints: options.breakpoints ?? [],
       stepMode: options.stepMode,
@@ -259,7 +262,7 @@ export class RunController {
       notifyPermission: (req) => this.handlePermission(entry, options, req),
       notifyInput: (req) => this.handleInput(entry, options, req),
     }
-    const run = new WorkflowRun(request, callbacks, { env: this.env })
+    const run = new WorkflowRun(request, callbacks, { env: this.env, workspace: this.workspace })
     entry.run = run
     if (entry.interactive) run.setInteractiveInput(true)
 

@@ -3,8 +3,9 @@
 // The "./server" export: build the IDE's HTTP + WebSocket host as a THIN adapter
 // over the runtime. `createServer(runtime)` returns an Express app (all /api/*
 // routes), a WebSocketServer bridging the WS protocol to the runtime, and a
-// `listen()` helper. The server constructs NO engine of its own — every run goes
-// through `runtime.run()`/`runtime.get()`. There is exactly one engine.
+// `listen()` helper. The server constructs NO engine and holds NO resolution
+// logic of its own — every request routes `:workspaceId` to
+// `runtime.workspaces.getOrThrow(id)` and PROJECTS the Workspace/Runtime to JSON.
 import http from 'node:http'
 import fs from 'node:fs'
 import path from 'node:path'
@@ -12,8 +13,6 @@ import express from 'express'
 import { WebSocketServer } from 'ws'
 import type { WebSocket } from 'ws'
 import { z } from 'zod'
-import { ACP_AGENT_LIST } from '../shared/agents.ts'
-import type { AcpAgentSpec } from '../shared/agents.ts'
 import { validateWorkflow } from '../shared/validate.ts'
 import type {
   AgentsResponse,
@@ -21,24 +20,22 @@ import type {
   ClientMessage,
   PromptsResponse,
   ServerMessage,
+  WorkspaceInfo,
+  WorkspacesResponse,
 } from '../shared/protocol.ts'
-import {
-  PORT,
-  DEFAULT_CWD,
-  PACKAGE_ROOT,
-  resolveAgentBin,
-  PROJECT_PROMPTS_DIR,
-  USER_PROMPTS_DIR,
-  PROJECT_TOOLS_DIR,
-  USER_TOOLS_DIR,
-} from './config.ts'
-import { listWorkflows, readWorkflow, writeWorkflow, deleteWorkflow } from './store/workflows.ts'
-import { loadCapabilities } from './workflow/capability-loader.ts'
-import { readCapabilityFile, writeCapabilityFile } from './store/capabilities.ts'
-import { loadPrompts } from './workflow/prompt-loader.ts'
-import { readPrompt, writePrompt } from './store/prompts.ts'
+import { PORT, PACKAGE_ROOT } from './config.ts'
 import { RunManager } from './run-manager.ts'
 import type { Runtime } from '../runtime/index.ts'
+import type { Workspace } from '../runtime/workspace.ts'
+
+declare global {
+  // eslint-disable-next-line @typescript-eslint/no-namespace
+  namespace Express {
+    interface Request {
+      workspace: Workspace
+    }
+  }
+}
 
 export interface CreateServerOptions {
   /** Secret source for capability secret-status (NEVER values). Defaults to
@@ -55,26 +52,21 @@ export interface CreatedServer {
   listen: (port?: number, onListening?: () => void) => http.Server
 }
 
+type Tier = 'project' | 'user'
+function asTier(value: string): Tier {
+  if (value === 'project' || value === 'user') return value
+  throw new Error('Unknown tier')
+}
+
 /**
  * Build the IDE server as a pure consumer of {@link Runtime}. The WS bridge maps
- * inbound ClientMessage → runtime handle calls and runtime events → ServerMessage
- * (see {@link RunManager}); the HTTP routes are the existing /api/* surface.
+ * inbound ClientMessage → workspace handle calls and runtime events →
+ * ServerMessage (see {@link RunManager}); the HTTP routes are the workspace-scoped
+ * /api/* surface.
  */
 export function createServer(runtime: Runtime, opts: CreateServerOptions = {}): CreatedServer {
   const env = opts.env ?? process.env
-
-  function isInstalled(agentId: string): boolean {
-    const candidates = [
-      resolveAgentBin(agentId),
-      path.join(PACKAGE_ROOT, 'node_modules', '@agentclientprotocol', `${agentId}-agent-acp`),
-      path.join(PACKAGE_ROOT, 'node_modules', '@agentclientprotocol', `${agentId}-acp`),
-    ].filter(Boolean) as string[]
-    return candidates.some((p) => fs.existsSync(p))
-  }
-
-  function agentsWithStatus(): AcpAgentSpec[] {
-    return ACP_AGENT_LIST.map((a) => ({ ...a, installed: isInstalled(a.id) }))
-  }
+  const registry = runtime.workspaces
 
   const app = express()
   app.use(express.json({ limit: '4mb' }))
@@ -84,21 +76,77 @@ export function createServer(runtime: Runtime, opts: CreateServerOptions = {}): 
   })
 
   app.get('/api/agents', (_req, res) => {
-    const body: AgentsResponse = { agents: agentsWithStatus(), defaultCwd: DEFAULT_CWD }
+    const body: AgentsResponse = { agents: runtime.listAgents(), defaultCwd: registry.default().root }
     res.json(body)
   })
 
-  app.get('/api/workflows', async (_req, res, next) => {
+  // --- Registry routes (unprefixed) ---------------------------------------
+  app.get('/api/workspaces', (_req, res) => {
+    const body: WorkspacesResponse = {
+      workspaces: registry.list(),
+      defaultWorkspaceId: registry.defaultId(),
+    }
+    res.json(body)
+  })
+
+  const openWorkspaceSchema = z.object({ root: z.string() })
+  app.post('/api/workspaces', (req, res, next) => {
+    let root: string
     try {
-      res.json(await listWorkflows())
+      ;({ root } = openWorkspaceSchema.parse(req.body))
+    } catch {
+      return res.status(400).json({ error: 'root is required' })
+    }
+    try {
+      const ws = registry.open(path.resolve(root))
+      const info: WorkspaceInfo = {
+        id: ws.id,
+        name: ws.name,
+        root: ws.root,
+        isDefault: ws.id === registry.defaultId(),
+      }
+      res.json(info)
     } catch (err) {
       next(err)
     }
   })
 
-  app.get('/api/workflows/:name', async (req, res) => {
+  app.delete('/api/workspaces/:workspaceId', async (req, res) => {
     try {
-      const content = await readWorkflow(req.params.name)
+      await registry.close(req.params.workspaceId)
+      res.json({ ok: true })
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err)
+      const status =
+        message === 'Cannot close the last open workspace'
+          ? 409
+          : message.startsWith('Unknown workspace')
+            ? 404
+            : 500
+      res.status(status).json({ error: message })
+    }
+  })
+
+  // --- Workspace-scoped resource router -----------------------------------
+  const wsRouter = express.Router({ mergeParams: true })
+  wsRouter.use((req, res, next) => {
+    const ws = registry.get(String(req.params.workspaceId))
+    if (!ws) return res.status(404).json({ error: 'Unknown workspace' })
+    req.workspace = ws
+    next()
+  })
+
+  wsRouter.get('/workflows', async (req, res, next) => {
+    try {
+      res.json(await req.workspace.listWorkflows())
+    } catch (err) {
+      next(err)
+    }
+  })
+
+  wsRouter.get('/workflows/:name', async (req, res) => {
+    try {
+      const content = await req.workspace.readWorkflow(req.params.name)
       res.json({ name: req.params.name, content })
     } catch {
       res.status(404).json({ error: 'Workflow not found' })
@@ -106,10 +154,10 @@ export function createServer(runtime: Runtime, opts: CreateServerOptions = {}): 
   })
 
   const saveSchema = z.object({ content: z.string() })
-  app.put('/api/workflows/:name', async (req, res, next) => {
+  wsRouter.put('/workflows/:name', async (req, res, next) => {
     try {
       const { content } = saveSchema.parse(req.body)
-      const info = await writeWorkflow(req.params.name, content)
+      const info = await req.workspace.writeWorkflow(req.params.name, content)
       res.json(info)
     } catch (err) {
       if (err instanceof z.ZodError) return res.status(400).json({ error: 'content is required' })
@@ -117,18 +165,18 @@ export function createServer(runtime: Runtime, opts: CreateServerOptions = {}): 
     }
   })
 
-  app.delete('/api/workflows/:name', async (req, res, next) => {
+  wsRouter.delete('/workflows/:name', async (req, res, next) => {
     try {
-      await deleteWorkflow(req.params.name)
+      await req.workspace.deleteWorkflow(req.params.name)
       res.json({ ok: true })
     } catch (err) {
       next(err)
     }
   })
 
-  app.get('/api/capabilities', async (_req, res, next) => {
+  wsRouter.get('/capabilities', async (req, res, next) => {
     try {
-      const { entries } = await loadCapabilities(env)
+      const { entries } = await req.workspace.loadCapabilities(env)
       const body: CapabilitiesResponse = { capabilities: entries }
       res.json(body)
     } catch (err) {
@@ -136,9 +184,9 @@ export function createServer(runtime: Runtime, opts: CreateServerOptions = {}): 
     }
   })
 
-  app.get('/api/prompts', async (_req, res, next) => {
+  wsRouter.get('/prompts', async (req, res, next) => {
     try {
-      const { entries } = await loadPrompts()
+      const { entries } = await req.workspace.loadPrompts()
       const body: PromptsResponse = { prompts: entries }
       res.json(body)
     } catch (err) {
@@ -146,15 +194,9 @@ export function createServer(runtime: Runtime, opts: CreateServerOptions = {}): 
     }
   })
 
-  function promptDirFor(tier: string): string {
-    if (tier === 'project') return PROJECT_PROMPTS_DIR
-    if (tier === 'user') return USER_PROMPTS_DIR
-    throw new Error('Unknown prompt tier')
-  }
-
-  app.get('/api/prompts/:tier/:name', async (req, res) => {
+  wsRouter.get('/prompts/:tier/:name', async (req, res) => {
     try {
-      const { content } = await readPrompt(promptDirFor(req.params.tier), req.params.name)
+      const { content } = await req.workspace.readPromptFile(asTier(req.params.tier), req.params.name)
       res.json({ name: req.params.name, content })
     } catch {
       res.status(404).json({ error: 'Prompt not found' })
@@ -162,25 +204,19 @@ export function createServer(runtime: Runtime, opts: CreateServerOptions = {}): 
   })
 
   const savePromptSchema = z.object({ content: z.string() })
-  app.put('/api/prompts/:tier/:name', async (req, res, next) => {
+  wsRouter.put('/prompts/:tier/:name', async (req, res, next) => {
     try {
       const { content } = savePromptSchema.parse(req.body)
-      res.json(await writePrompt(promptDirFor(req.params.tier), req.params.name, content))
+      res.json(await req.workspace.writePromptFile(asTier(req.params.tier), req.params.name, content))
     } catch (err) {
       if (err instanceof z.ZodError) return res.status(400).json({ error: 'content is required' })
       next(err)
     }
   })
 
-  function toolDirFor(tier: string): string {
-    if (tier === 'project') return PROJECT_TOOLS_DIR
-    if (tier === 'user') return USER_TOOLS_DIR
-    throw new Error('Unknown tool tier')
-  }
-
-  app.get('/api/tools/:tier/:name', async (req, res) => {
+  wsRouter.get('/tools/:tier/:name', async (req, res) => {
     try {
-      const { content } = await readCapabilityFile(toolDirFor(req.params.tier), req.params.name)
+      const { content } = await req.workspace.readToolFile(asTier(req.params.tier), req.params.name)
       res.json({ name: req.params.name, content })
     } catch {
       res.status(404).json({ error: 'Tool not found' })
@@ -188,10 +224,10 @@ export function createServer(runtime: Runtime, opts: CreateServerOptions = {}): 
   })
 
   const saveToolSchema = z.object({ content: z.string() })
-  app.put('/api/tools/:tier/:name', async (req, res, next) => {
+  wsRouter.put('/tools/:tier/:name', async (req, res, next) => {
     try {
       const { content } = saveToolSchema.parse(req.body)
-      res.json(await writeCapabilityFile(toolDirFor(req.params.tier), req.params.name, content))
+      res.json(await req.workspace.writeToolFile(asTier(req.params.tier), req.params.name, content))
     } catch (err) {
       if (err instanceof z.ZodError) return res.status(400).json({ error: 'content is required' })
       next(err)
@@ -199,7 +235,7 @@ export function createServer(runtime: Runtime, opts: CreateServerOptions = {}): 
   })
 
   const validateSchema = z.object({ source: z.string() })
-  app.post('/api/validate', async (req, res, next) => {
+  wsRouter.post('/validate', async (req, res, next) => {
     let source: string
     try {
       ;({ source } = validateSchema.parse(req.body))
@@ -207,12 +243,41 @@ export function createServer(runtime: Runtime, opts: CreateServerOptions = {}): 
       return res.status(400).json({ error: 'source is required' })
     }
     try {
-      const { capabilities, prompts } = await runtime.catalogs()
+      const { capabilities, prompts } = await req.workspace.catalogs()
       res.json(validateWorkflow(source, undefined, undefined, capabilities, prompts))
     } catch (err) {
       next(err)
     }
   })
+
+  // Editor intellisense for tool/capability files — bridges the workspace's
+  // node_modules to the browser's Monaco worker (which has no filesystem) so a
+  // tool .ts buffer's sibling and npm imports resolve in-editor the same way they
+  // already do at run time (host-loaded `await import()`).
+  wsRouter.get('/tool-sources', (req, res, next) => {
+    try {
+      res.json({ libs: req.workspace.toolSources() })
+    } catch (err) {
+      next(err)
+    }
+  })
+
+  const toolTypesSchema = z.object({ specifiers: z.array(z.string()) })
+  wsRouter.post('/tool-types', (req, res, next) => {
+    let specifiers: string[]
+    try {
+      ;({ specifiers } = toolTypesSchema.parse(req.body))
+    } catch {
+      return res.status(400).json({ error: 'specifiers must be a string array' })
+    }
+    try {
+      res.json({ libs: req.workspace.resolveToolTypes(specifiers) })
+    } catch (err) {
+      next(err)
+    }
+  })
+
+  app.use('/api/workspaces/:workspaceId', wsRouter)
 
   // Serve the built frontend from the installed package (NOT the user's cwd), so
   // `npx agentprism-ide` from an arbitrary directory still serves the bundled UI.
@@ -231,14 +296,19 @@ export function createServer(runtime: Runtime, opts: CreateServerOptions = {}): 
 
   const server = http.createServer(app)
   const wss = new WebSocketServer({ server, path: '/ws' })
-  const manager = new RunManager(runtime)
+  const manager = new RunManager(registry)
 
   function send(ws: WebSocket, msg: ServerMessage): void {
     if (ws.readyState === ws.OPEN) ws.send(JSON.stringify(msg))
   }
 
   wss.on('connection', (ws: WebSocket) => {
-    send(ws, { t: 'hello', agents: agentsWithStatus() })
+    send(ws, {
+      t: 'hello',
+      agents: runtime.listAgents(),
+      workspaces: registry.list(),
+      defaultWorkspaceId: registry.defaultId(),
+    })
     ws.on('message', (data) => {
       let message: ClientMessage
       try {
@@ -261,9 +331,9 @@ export function createServer(runtime: Runtime, opts: CreateServerOptions = {}): 
     return server.listen(port, () => {
       console.log(`\n  AgentPrism backend listening on http://localhost:${port}`)
       console.log(`  WebSocket:        ws://localhost:${port}/ws`)
-      console.log(`  Default work dir: ${DEFAULT_CWD}`)
+      console.log(`  Default work dir: ${registry.default().root}`)
       console.log(
-        `  Agents installed: ${agentsWithStatus().filter((a) => a.installed).map((a) => a.id).join(', ') || 'none (will use npx)'}\n`,
+        `  Agents installed: ${runtime.listAgents().filter((a) => a.installed).map((a) => a.id).join(', ') || 'none (will use npx)'}\n`,
       )
       onListening?.()
     })

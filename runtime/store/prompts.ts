@@ -1,6 +1,5 @@
 import fs from 'node:fs/promises'
 import path from 'node:path'
-import { PROMPT_DIRS } from '../config.ts'
 
 export interface PromptFileInfo {
   /** Bare name (filename minus .hbs); GUARANTEED a JS identifier. */
@@ -43,9 +42,11 @@ function bareNameOf(fileName: string): string {
  * - identifier-style guard + realpath containment check,
  * - dedupe by bareName, project tier wins (project shadows user).
  */
-export async function scanPromptFiles(): Promise<PromptFileInfo[]> {
+export async function scanPromptFiles(
+  promptDirs: readonly { dir: string; tier: 'project' | 'user' }[],
+): Promise<PromptFileInfo[]> {
   const byBareName = new Map<string, PromptFileInfo>()
-  for (const { dir, tier } of PROMPT_DIRS) {
+  for (const { dir, tier } of promptDirs) {
     await fs.mkdir(dir, { recursive: true })
     let dirReal: string
     try {
@@ -102,6 +103,7 @@ export async function writePrompt(
   tierDir: string,
   name: string,
   content: string,
+  tier: 'project' | 'user',
 ): Promise<PromptFileInfo> {
   const fileName = name.endsWith('.hbs') ? name : `${name}.hbs`
   if (!isSafePromptFileName(fileName)) throw new Error('Invalid prompt name (identifier + .hbs only).')
@@ -109,5 +111,5 @@ export async function writePrompt(
   const full = path.join(tierDir, fileName)
   await fs.writeFile(full, content, 'utf8')
   const st = await fs.stat(full)
-  return { name: bareNameOf(fileName), path: full, tier: 'project', modifiedAt: st.mtimeMs, body: content }
+  return { name: bareNameOf(fileName), path: full, tier, modifiedAt: st.mtimeMs, body: content }
 }

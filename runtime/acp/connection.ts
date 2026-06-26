@@ -25,7 +25,7 @@ import type {
   StopReason,
 } from '@agentclientprotocol/sdk'
 import type { AcpAgentSpec } from '../../shared/agents.ts'
-import { resolveAgentBin } from '../config.ts'
+import { resolveAgentBin } from '../paths.ts'
 
 export type LogFn = (level: string, type: string, text: string, data?: unknown) => void
 

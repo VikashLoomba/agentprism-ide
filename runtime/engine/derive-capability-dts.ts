@@ -1,4 +1,4 @@
-// server/workflow/derive-capability-dts.ts
+// runtime/engine/derive-capability-dts.ts
 // Derives each capability's injected-namespace `.d.ts` body from its effect
 // FUNCTION SIGNATURES, using the TypeScript checker to COMPUTE the transformed
 // signatures (we do no string surgery on signatures). A synthetic in-memory
@@ -7,6 +7,7 @@
 //     (ctx: CapabilityContext, args: A) => Promise<R> | R   ==>   (args: A) => Promise<Awaited<R>>
 // `checker.typeToString` then prints the fully-resolved structural object type.
 
+import fs from 'node:fs'
 import * as path from 'node:path'
 import * as ts from 'typescript'
 
@@ -16,13 +17,16 @@ export interface DerivableFile {
   modifiedAt: number
 }
 
-// Repo root = two levels up from this file (server/workflow/ -> repo). Anchors
-// @types/node discovery via host.getCurrentDirectory (the load-bearing fix that
-// makes node:* resolve, so e.g. git's join() return type is `string`, not `any`).
-const REPO_ROOT = path.resolve(import.meta.dirname, '..', '..')
-
-const INJECT_PATH = path.join(REPO_ROOT, '__prism_inject__.ts')
-const CHECK_PATH = path.join(REPO_ROOT, '__prism_check__.ts')
+/** Anchors for the throwaway dts Program (§5.3). Every path derives from the
+ *  workspace root + the AgentPrism package root — never from process.cwd(). */
+export interface DeriveDtsOptions {
+  /** The owning workspace's root (anchors @types/node + npm resolution + cache key). */
+  workspaceRoot: string
+  /** AgentPrism's install dir; its `shared/capability.ts` backs the cap-API overlay. */
+  packageRoot: string
+  /** `path.dirname(USER_TOOLS_DIR)` = `~/.agentprism` — the user-tier shim parent (B15). */
+  userToolsParent: string
+}
 
 const COMPILER_OPTIONS: ts.CompilerOptions = {
   target: ts.ScriptTarget.ES2022,
@@ -36,6 +40,9 @@ const COMPILER_OPTIONS: ts.CompilerOptions = {
   // Turning it off keeps per-effect types WITHOUT loosening return-type inference.
   strictFunctionTypes: false,
   skipLibCheck: true,
+  // Keep private/patched/monorepo-linked deps under <ws>/node_modules so the
+  // node_modules filter + virtual re-keying keep working (§5.2).
+  preserveSymlinks: true,
   types: ['node'], // auto-include @types/node so node:* builtins resolve
 }
 
@@ -61,7 +68,8 @@ function driverName(filePath: string): string {
   return 'v_' + Buffer.from(filePath).toString('hex')
 }
 
-/** The synthetic check module: one value-import + one driver const per tool. */
+/** The synthetic check module: one value-import + one driver const per tool. The
+ *  inject module is a sibling, so it is imported by relative specifier. */
 function buildCheckSrc(files: DerivableFile[]): string {
   const lines = [`import type { InjectedNamespace, Expand } from './__prism_inject__.ts'`]
   files.forEach((f, i) => lines.push(`import _t${i} from '${f.path}'`))
@@ -73,14 +81,16 @@ function buildCheckSrc(files: DerivableFile[]): string {
   return lines.join('\n') + '\n'
 }
 
-/** Overlay CompilerHost: layers the 2 synthetic files over disk; node + @types
- *  + the .ts relative import keep resolving through the unmodified base host. */
-function buildProgram(overlays: Map<string, string>): {
-  program: ts.Program
-  checker: ts.TypeChecker
-} {
+/** Overlay CompilerHost: layers the synthetic files + the cap-API overlay over
+ *  disk; node + @types + the .ts relative imports keep resolving through the
+ *  unmodified base host, anchored at the workspace root. */
+function buildProgram(
+  overlays: Map<string, string>,
+  checkPath: string,
+  workspaceRoot: string,
+): { program: ts.Program; checker: ts.TypeChecker } {
   const host = ts.createCompilerHost(COMPILER_OPTIONS)
-  host.getCurrentDirectory = () => REPO_ROOT
+  host.getCurrentDirectory = () => workspaceRoot
 
   const norm = new Map<string, string>()
   for (const [p, text] of overlays) norm.set(ts.sys.resolvePath(p), text)
@@ -100,7 +110,7 @@ function buildProgram(overlays: Map<string, string>): {
     return o !== undefined ? o : origRead(fileName)
   }
 
-  const program = ts.createProgram([CHECK_PATH], COMPILER_OPTIONS, host)
+  const program = ts.createProgram([checkPath], COMPILER_OPTIONS, host)
   return { program, checker: program.getTypeChecker() }
 }
 
@@ -113,30 +123,54 @@ function toBraceBody(objType: string): string {
 }
 
 // Building a TS Program is CPU-heavy and loadCapabilities() runs on every
-// /api/validate. Cache by a (path:mtime) signature so the Program is rebuilt only
-// when a tool file actually changes.
-let cache: { sig: string; map: Map<string, string> } | null = null
+// /api/validate. Cache by (workspaceRoot) -> (path:mtime) signature so the
+// Program is rebuilt only when a tool file actually changes, and two workspaces
+// with same-path/same-mtime tools do not share a derived dts (B4, §5.3).
+const cache = new Map<string, { sig: string; map: Map<string, string> }>()
+
+/** Drop a closed workspace's derived-dts cache entry (WorkspaceRegistry.close,
+ *  §1.2 step 2). The runtime's ONLY per-workspace catalog cache. */
+export function evictCapabilityDtsCache(workspaceRoot: string): void {
+  cache.delete(workspaceRoot)
+}
 
 /**
  * Map each capability file path → its derived namespace `.d.ts` body (the inside
  * of `declare const <ns>: { … }`). Files that don't default-export a capability
  * (pure helpers) yield an empty `{}` body, which is then skipped.
  */
-export function deriveCapabilityDts(files: DerivableFile[]): Map<string, string> {
+export function deriveCapabilityDts(files: DerivableFile[], opts: DeriveDtsOptions): Map<string, string> {
+  const { workspaceRoot, packageRoot, userToolsParent } = opts
   const sig = files
     .map((f) => `${f.path}:${f.modifiedAt}`)
     .sort()
     .join('|')
-  if (cache && cache.sig === sig) return cache.map
+  const cached = cache.get(workspaceRoot)
+  if (cached && cached.sig === sig) return cached.map
+
+  const injectPath = path.join(workspaceRoot, '__prism_inject__.ts')
+  const checkPath = path.join(workspaceRoot, '__prism_check__.ts')
 
   const map = new Map<string, string>()
   if (files.length > 0) {
     const overlays = new Map<string, string>([
-      [INJECT_PATH, INJECT_SRC],
-      [CHECK_PATH, buildCheckSrc(files)],
+      [injectPath, INJECT_SRC],
+      [checkPath, buildCheckSrc(files)],
     ])
-    const { program, checker } = buildProgram(overlays)
-    const checkSf = program.getSourceFile(CHECK_PATH)
+    // The single AgentPrism-owned capability API source (§0). Overlaid at BOTH the
+    // workspace-relative path (project-tier tools + INJECT_SRC's `./shared/...`) AND
+    // the user-tier path (~/.agentprism/shared/...) so every tier's relative import
+    // resolves to PACKAGE_ROOT's source. Both overlays point at the ONE source.
+    try {
+      const capSrc = fs.readFileSync(path.join(packageRoot, 'shared', 'capability.ts'), 'utf8')
+      overlays.set(path.join(workspaceRoot, 'shared', 'capability.ts'), capSrc)
+      overlays.set(path.join(userToolsParent, 'shared', 'capability.ts'), capSrc)
+    } catch {
+      /* PACKAGE_ROOT cap source unreadable — fall through; imports squiggle but the
+         loader still degrades to the loose fallback dts per-file. */
+    }
+    const { program, checker } = buildProgram(overlays, checkPath, workspaceRoot)
+    const checkSf = program.getSourceFile(checkPath)
     if (checkSf) {
       // keyed by driver-const name, to map results back to file.path.
       const byDriver = new Map(files.map((f) => [driverName(f.path), f.path]))
@@ -161,6 +195,6 @@ export function deriveCapabilityDts(files: DerivableFile[]): Map<string, string>
     }
   }
 
-  cache = { sig, map }
+  cache.set(workspaceRoot, { sig, map })
   return map
 }

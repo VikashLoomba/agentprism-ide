@@ -5,10 +5,12 @@
 // the whole catalog: per-module import/validation failures are captured as a
 // `loadError` string on the entry instead of throwing.
 
+import path from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { z } from 'zod'
 import { scanCapabilityFiles } from '../store/capabilities.ts'
 import { deriveCapabilityDts } from './derive-capability-dts.ts'
+import { USER_TOOLS_DIR } from '../paths.ts'
 import type { Capability, EffectFn } from '../../shared/capability.ts'
 import type { CapabilityCatalogEntry } from '../../shared/protocol.ts'
 import type { CapabilityCatalog } from '../../shared/capability-resolve.ts'
@@ -39,6 +41,14 @@ export interface LoadedCapabilities {
   modules: Map<string, Capability>
 }
 
+/** Anchored inputs to load a workspace's capability catalog (§WU-3). */
+export interface LoadCapabilitiesOptions {
+  capabilityDirs: readonly { dir: string; tier: 'project' | 'user' }[]
+  workspaceRoot: string
+  packageRoot: string
+  env?: NodeJS.ProcessEnv
+}
+
 /** Compute per-secret presence from the host env (booleans only — never values). */
 function computeSecretStatus(
   secrets: string[],
@@ -60,13 +70,21 @@ function computeSecretStatus(
  * compute `secretStatus` from `env`, and build a safe catalog entry. Failures are
  * captured per-module as `loadError` so one bad file never breaks the catalog.
  */
-export async function loadCapabilities(env: NodeJS.ProcessEnv = process.env): Promise<LoadedCapabilities> {
-  const scanned = (await scanCapabilityFiles()) as ScannedCapabilityFile[]
+export async function loadCapabilities(o: LoadCapabilitiesOptions): Promise<LoadedCapabilities> {
+  const env = o.env ?? process.env
+  const scanned = (await scanCapabilityFiles(o.capabilityDirs)) as ScannedCapabilityFile[]
 
   // Derive each capability's namespace `.d.ts` from its effect signatures (no
-  // hand-written `dts`). Cached by path+mtime, so this only rebuilds a TS Program
-  // when a tool file actually changes.
-  const derivedDts = deriveCapabilityDts(scanned.map((f) => ({ path: f.path, modifiedAt: f.modifiedAt })))
+  // hand-written `dts`). Cached by (workspaceRoot)+(path+mtime), so this only
+  // rebuilds a TS Program when a tool file actually changes (§5.3).
+  const derivedDts = deriveCapabilityDts(
+    scanned.map((f) => ({ path: f.path, modifiedAt: f.modifiedAt })),
+    {
+      workspaceRoot: o.workspaceRoot,
+      packageRoot: o.packageRoot,
+      userToolsParent: path.dirname(USER_TOOLS_DIR),
+    },
+  )
 
   const entries: CapabilityCatalogEntry[] = []
   const modules = new Map<string, Capability>()

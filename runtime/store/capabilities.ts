@@ -1,6 +1,5 @@
 import fs from 'node:fs/promises'
 import path from 'node:path'
-import { CAPABILITY_DIRS } from '../config.ts'
 
 export interface CapabilityFileInfo {
   /** Bare capability name (file basename without extension). */
@@ -35,10 +34,12 @@ function bareNameOf(fileName: string): string {
  * - safeName-style guard + realpath containment check,
  * - dedupe by bareName, project tier wins (project shadows user).
  */
-export async function scanCapabilityFiles(): Promise<CapabilityFileInfo[]> {
+export async function scanCapabilityFiles(
+  capabilityDirs: readonly { dir: string; tier: 'project' | 'user' }[],
+): Promise<CapabilityFileInfo[]> {
   const byBareName = new Map<string, CapabilityFileInfo>()
 
-  for (const { dir, tier } of CAPABILITY_DIRS) {
+  for (const { dir, tier } of capabilityDirs) {
     await fs.mkdir(dir, { recursive: true })
 
     // Resolve the tier root once for containment comparison.
@@ -112,6 +113,7 @@ export async function writeCapabilityFile(
   tierDir: string,
   fileName: string,
   content: string,
+  tier: 'project' | 'user',
 ): Promise<CapabilityFileInfo> {
   if (!isSafeFileName(fileName) || !CAPABILITY_EXTS.includes(path.extname(fileName))) {
     throw new Error('Invalid tool file name (.ts/.js/.mjs only).')
@@ -120,5 +122,5 @@ export async function writeCapabilityFile(
   const full = path.join(tierDir, fileName)
   await fs.writeFile(full, content, 'utf8')
   const st = await fs.stat(full)
-  return { name: bareNameOf(fileName), path: full, tier: 'project', modifiedAt: st.mtimeMs }
+  return { name: bareNameOf(fileName), path: full, tier, modifiedAt: st.mtimeMs }
 }

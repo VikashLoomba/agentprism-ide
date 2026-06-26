@@ -1,0 +1,132 @@
+{
+  "$comment": "Definitive disjoint+complete work-unit decomposition for the Workspace architecture plan (docs/workspace-architecture-plan.md §7). Each touched file is owned by EXACTLY ONE unit (its substantive/final-content owner). WU-R is the foundational MECHANICAL relocation unit: it physically git-mv's the entire server-tier subtree into runtime/ and thins server/config.ts; in the by-file fan-out model every body-edited moved file is git-mv'd-then-edited by its single owning unit (which dependsOn WU-R for sequencing), so WU-R's 'files' lists only the pure-relocation files no later unit re-edits. Union of all unit files == the 44 touched files; sets are pairwise disjoint. dependsOn mirrors plan §7 and is a valid DAG (co-landing pairs WU-6/WU-7 and WU-9/WU-10 are encoded as a single directed edge, never a cycle).",
+  "workUnits": [
+    {
+      "id": "WU-0",
+      "summary": "Protocol & shared DTOs: add workspaceId to RunRequest + every run-scoped ClientMessage/ServerMessage; extend hello with workspaces/defaultWorkspaceId; add WorkspaceInfo/WorkspacesResponse/OpenWorkspaceRequest DTOs.",
+      "files": ["shared/protocol.ts"],
+      "dependsOn": []
+    },
+    {
+      "id": "WU-R",
+      "summary": "Mechanical relocation foundation (§6.1): git mv server/workflow -> runtime/engine, server/store -> runtime/store, server/acp -> runtime/acp, tool-intellisense to runtime root; split server/config.ts (thin it to PORT + re-export of PACKAGE_ROOT/resolveAgentBin from runtime/paths.ts, delete the six eager cwd consts); add 'runtime' to tsconfig.server.json#include; perform the interim import-specifier rewrites that make the tree resolve. This unit's files are the pure-relocation files no later unit re-edits; every body-edited moved file is owned by its substantive unit (which performs its own git-mv+edit, dependsOn WU-R).",
+      "files": [
+        "runtime/engine/executor.ts",
+        "runtime/engine/instrument.ts",
+        "runtime/engine/errors.ts",
+        "runtime/engine/methods/completenessCheck.ts",
+        "runtime/engine/methods/judgePanel.ts",
+        "runtime/engine/methods/pipeline.ts",
+        "runtime/engine/methods/gate.ts",
+        "runtime/engine/methods/jsonSchema.ts",
+        "runtime/engine/methods/parallel.ts",
+        "runtime/engine/methods/loopUntilDry.ts",
+        "runtime/engine/methods/retry.ts",
+        "runtime/engine/methods/verify.ts",
+        "runtime/engine/methods/index.ts",
+        "runtime/acp/connection.ts",
+        "server/config.ts",
+        "tsconfig.server.json"
+      ],
+      "dependsOn": []
+    },
+    {
+      "id": "WU-1",
+      "summary": "runtime/paths.ts: house the relocated resolution consts (PACKAGE_ROOT, findPackageRoot, AGENT_BINS, resolveAgentBin, HOME, USER_TOOLS_DIR, USER_PROMPTS_DIR) and add the pure deriveWorkspaceDirs(root, {env, useEnvOverrides}) helper (WU-1, §3.1/§7).",
+      "files": ["runtime/paths.ts"],
+      "dependsOn": ["WU-R"]
+    },
+    {
+      "id": "WU-2",
+      "summary": "Stores parameterized: workflows.ts/capabilities.ts/prompts.ts take explicit dir/capabilityDirs/promptDirs args instead of eager consts; add tier param to writeCapabilityFile/writePrompt and return it (B14).",
+      "files": [
+        "runtime/store/workflows.ts",
+        "runtime/store/capabilities.ts",
+        "runtime/store/prompts.ts"
+      ],
+      "dependsOn": ["WU-R"]
+    },
+    {
+      "id": "WU-3",
+      "summary": "Loaders parameterized: capability-loader.ts (LoadCapabilitiesOptions with capabilityDirs/workspaceRoot/packageRoot/env), prompt-loader.ts (loadPrompts(promptDirs)), derive-capability-dts.ts (§5.3 workspaceRoot anchor + PACKAGE_ROOT cap overlay at project AND userToolsParent paths, preserveSymlinks, workspace-keyed cache + exported evictCapabilityDtsCache).",
+      "files": [
+        "runtime/engine/capability-loader.ts",
+        "runtime/engine/prompt-loader.ts",
+        "runtime/engine/derive-capability-dts.ts"
+      ],
+      "dependsOn": ["WU-R", "WU-2"]
+    },
+    {
+      "id": "WU-4",
+      "summary": "Inliner parameterized: inline.ts drops TOOLS_DIRS global; InlineOptions gains toolsDirs + projectToolsDir; isUnderToolsDir/inlineHelpers use opts.",
+      "files": ["runtime/engine/inline.ts"],
+      "dependsOn": ["WU-R"]
+    },
+    {
+      "id": "WU-5",
+      "summary": "Tool-intellisense rewritten (§4): ToolIntellisenseAnchor-parameterized, probe at nodeModulesRoot, preserveSymlinks:true, virtual paths prefixed file:///<wsId>/...; preserve .d.ts match, typescript/@types/node skips, package.json shipping.",
+      "files": ["runtime/tool-intellisense.ts"],
+      "dependsOn": ["WU-R"]
+    },
+    {
+      "id": "WU-6",
+      "summary": "Workspace + Registry + id: createWorkspace factory (LOCKED construction order, both capability shims §5.4), computeWorkspaceId/canonicalizeRoot (§1.1), prepareRun helper; createWorkspaceRegistry with first-class open/close lifecycle (§1.2, insertion-order default reassignment, evictCapabilityDtsCache on close). Co-lands with WU-7.",
+      "files": ["runtime/workspace.ts", "runtime/workspace-registry.ts"],
+      "dependsOn": ["WU-R", "WU-1", "WU-2", "WU-3", "WU-4", "WU-5"]
+    },
+    {
+      "id": "WU-7",
+      "summary": "RunController + WorkflowRun take a Workspace: run-controller.ts ctor {env,cwd,workspace}, defaultCwd from workspace.root, RunRequest.workspaceId; run.ts uses this.workspace.loadCapabilities/loadPrompts (drop now-unused named imports), inlineHelpers passes toolsDirs/projectToolsDir from workspace. Co-lands with WU-6 (atomic pair).",
+      "files": ["runtime/run-controller.ts", "runtime/engine/run.ts"],
+      "dependsOn": ["WU-R", "WU-6", "WU-3", "WU-4"]
+    },
+    {
+      "id": "WU-8",
+      "summary": "createRuntime + resolve + agents: index.ts builds createWorkspaceRegistry, opens options.workspaces (back-compat cwd default), exposes Runtime surface incl listAgents; resolve.ts resolveWorkflow(ref, workspace); NEW runtime/agents.ts (isAgentInstalled/listAgents relocated from factory.ts:67-77, §4.1).",
+      "files": ["runtime/index.ts", "runtime/resolve.ts", "runtime/agents.ts"],
+      "dependsOn": ["WU-6", "WU-7"]
+    },
+    {
+      "id": "WU-9",
+      "summary": "Server factory: createServer(runtime); registry routes (GET/POST/DELETE /api/workspaces with 409/404 mapping); workspace Router mounted at /api/workspaces/:workspaceId (mergeParams, req.workspace resolver, module augmentation); all resource routes delegate to req.workspace; delete isInstalled/agentsWithStatus + agent-probe imports; /api/agents and hello project runtime.listAgents(); banner rewrite; new RunManager(runtime.workspaces). Co-lands with WU-10.",
+      "files": ["server/factory.ts"],
+      "dependsOn": ["WU-0", "WU-6", "WU-8", "WU-10"]
+    },
+    {
+      "id": "WU-10",
+      "summary": "Run manager routes by workspaceId: constructor(registry), RunEntry gains workspaceId, start() resolves ws via registry and drives ws.runtime.run, all broadcasts add workspaceId, subscribe validates against entry.workspaceId. Co-lands with WU-9 (atomic pair).",
+      "files": ["server/run-manager.ts"],
+      "dependsOn": ["WU-0", "WU-8"]
+    },
+    {
+      "id": "WU-11",
+      "summary": "Bin + composition root: bin deletes process.chdir, computes root from --cwd, collects repeatable --workspace into extraRoots, createRuntime({workspaces:[root,...extraRoots]}); server/index.ts createRuntime() (default ws at cwd) + createServer + listen.",
+      "files": ["bin/agentprism-ide.mjs", "server/index.ts"],
+      "dependsOn": ["WU-8", "WU-9"]
+    },
+    {
+      "id": "WU-12",
+      "summary": "Frontend API + WS thread workspaceId: api.ts adds fetchWorkspaces/openWorkspace/closeWorkspace and a leading workspaceId param on every resource fn building /api/workspaces/:id/...; ws.ts caller includes workspaceId (ClientMessage already carries it).",
+      "files": ["src/lib/api.ts", "src/lib/ws.ts"],
+      "dependsOn": ["WU-0"]
+    },
+    {
+      "id": "WU-13",
+      "summary": "Store: workspace state + per-workspace runs/catalogs/editor-buffer/file-list as single source of truth. Adds workspaces/activeWorkspaceId/defaultWorkspaceId + open/close/setActive/refresh actions; catalogByWs/runByWs/editorByWs/filesByWs/workspaceAttention maps with top-level mirrors; inbound routing by msg.workspaceId with LOCKED missing-slot guard; switch lifecycle (snapshot->repoint->refresh->state); cwd<->workspace contract; init keys first fetch by resolved active id.",
+      "files": ["src/store/useStore.ts"],
+      "dependsOn": ["WU-12"]
+    },
+    {
+      "id": "WU-13b",
+      "summary": "Workspace picker + Header mount: NEW WorkspacePicker.tsx (store-connected Select with per-workspace attention badges, close affordance, Open folder...), global needs-input indicator scoped to live workspaces list, and the exact Header.tsx mount point after the logo block.",
+      "files": ["src/features/workspace/WorkspacePicker.tsx", "src/features/layout/Header.tsx"],
+      "dependsOn": ["WU-13"]
+    },
+    {
+      "id": "WU-14",
+      "summary": "Monaco namespacing + active-workspace swap: monaco-setup.ts per-workspace lib maps keyed by wsId + setActiveWorkspace(monaco,wsId) (setExtraLibs swap + dispose prior-ws tool models), file:///<wsId>/... URIs, marker listener wsId-scoped; WorkflowEditor.tsx wsId-prefixed model URIs + two store-subscribed effects (active-workspace swap effect + workflowDts effect) running after the state-only store switch.",
+      "files": ["src/lib/monaco-setup.ts", "src/features/editor/WorkflowEditor.tsx"],
+      "dependsOn": ["WU-12", "WU-13", "WU-13b"]
+    }
+  ]
+}

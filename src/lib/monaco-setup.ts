@@ -1,4 +1,5 @@
 import type { Monaco } from '@monaco-editor/react'
+import type { Uri } from 'monaco-editor'
 // Registers the bundled Handlebars language (id 'handlebars', ext '.hbs') so .hbs
 // files highlight (mustache delimiters + the embedded html grammar). Without this
 // side-effect import, .hbs falls back to plaintext — the single most likely
@@ -10,12 +11,15 @@ import 'monaco-editor/esm/vs/basic-languages/handlebars/handlebars.contribution'
 // instead of squiggling as an unresolved module.
 import capabilitySource from '@shared/capability.ts?raw'
 import { INITIAL_WORKFLOW_DSL_DTS } from './workflow-dts'
+import { fetchToolSources, fetchToolTypes } from './api'
 
 const WORKFLOW_DTS_FILE_PATH = 'ts:agentprism-workflow-globals.d.ts'
-// Virtual path the cap lib lives at. A tool buffer gets the model URI
-// file:///tools/<name>.ts (see WorkflowEditor), so its relative
-// `../shared/capability.ts` import resolves exactly here.
-const CAPABILITY_LIB_PATH = 'file:///shared/capability.ts'
+// The cap lib is namespaced per ACTIVE workspace: `file:///<wsId>/shared/capability.ts`.
+// A tool buffer gets the model URI `file:///<wsId>/tools/<name>.ts`, so its relative
+// `../shared/capability.ts` import resolves exactly there (§2.4).
+function capabilityLibPath(wsId: string): string {
+  return `file:///${wsId}/shared/capability.ts`
+}
 const NODE_SHIM_FILE_PATH = 'ts:agentprism-node-shim.d.ts'
 // Tool modules may `import { execFile } from 'node:child_process'` etc. Rather
 // than ship all of @types/node into the browser editor, declare node:* as a
@@ -25,8 +29,7 @@ const NODE_SHIM_DTS = `declare module 'node:*';\n`
 
 let configured = false
 // Tracks the currently-injected DSL .d.ts so re-injection is skipped when the
-// generated string is unchanged (the union only varies with the connected
-// agents / default agent, which change rarely).
+// generated string is unchanged.
 let lastDts = INITIAL_WORKFLOW_DSL_DTS
 
 export const MONACO_THEME = 'agentprism-dark'
@@ -48,8 +51,6 @@ export function configureMonaco(monaco: Monaco): void {
       { token: 'identifier', foreground: 'e4e4e7' },
       { token: 'delimiter', foreground: '9ca3af' },
       { token: 'type', foreground: '7dd3fc' },
-      // Handlebars/mustache (.hbs) delimiters + expressions, themed to match the
-      // dark palette. The grammar emits these scopes via the bundled contribution.
       { token: 'delimiter.handlebars', foreground: 'c4b5fd' },
       { token: 'keyword.helper.handlebars', foreground: 'c4b5fd' },
       { token: 'variable.parameter.handlebars', foreground: 'fda4af' },
@@ -87,8 +88,6 @@ export function configureMonaco(monaco: Monaco): void {
     checkJs: false,
     lib: ['es2023'],
   })
-  // Our acorn-based validator owns diagnostics; silence the TS service noise
-  // (top-level await/return) while keeping intellisense from the extra lib.
   js.setDiagnosticsOptions({
     noSemanticValidation: true,
     noSyntacticValidation: true,
@@ -96,16 +95,6 @@ export function configureMonaco(monaco: Monaco): void {
   })
   js.setExtraLibs([extraLib])
 
-  // Tool/capability modules (tools/<name>.ts) open as real TypeScript. Unlike the
-  // workflow .js buffer — whose diagnostics the acorn validator owns — we WANT the
-  // TS service live here so `defineCapability(...)` is fully typed and checked.
-  // For `import { defineCapability } from '../shared/capability.ts'` to resolve
-  // (rather than throw a phantom "cannot find module") we need: Bundler module
-  // resolution + allowImportingTsExtensions to accept the explicit `.ts`
-  // extension (load-bearing for the real Node loader). Monaco bundles TS 5.9,
-  // which supports both; only its hand-maintained monaco.d.ts enum is stale,
-  // hence the cast (ModuleResolutionKind.Bundler === 100). The cap-source +
-  // node:* shim libs supply the types so nothing squiggles as unresolved.
   const ts = monaco.languages.typescript.typescriptDefaults
   ts.setCompilerOptions({
     target: monaco.languages.typescript.ScriptTarget.ES2022,
@@ -116,10 +105,6 @@ export function configureMonaco(monaco: Monaco): void {
     allowNonTsExtensions: true,
     esModuleInterop: true,
     skipLibCheck: true,
-    // Effect authors narrow `args` to a concrete shape (args: { key: string }),
-    // which is intentionally MORE specific than EffectFn's Json parameter. Bivariant
-    // parameter checking lets that assign cleanly; the precise external signature is
-    // carried by each capability's own `dts`, so nothing real is lost here.
     strict: false,
     strictFunctionTypes: false,
     lib: ['es2023', 'dom'],
@@ -129,26 +114,148 @@ export function configureMonaco(monaco: Monaco): void {
     noSyntacticValidation: false,
     noSuggestionDiagnostics: true,
   })
-  ts.setExtraLibs([
-    { content: capabilitySource, filePath: CAPABILITY_LIB_PATH },
-    { content: NODE_SHIM_DTS, filePath: NODE_SHIM_FILE_PATH },
-  ])
+  // Libs are published once a workspace becomes active (setActiveWorkspace), since
+  // every lib URI is namespaced by the active workspaceId (§2.4).
+  ts.setExtraLibs([{ content: NODE_SHIM_DTS, filePath: NODE_SHIM_FILE_PATH }])
+  toolMonaco = monaco
+
+  // Work WITH Monaco, not around it: its TS worker already reports an unresolved
+  // npm import as a "cannot find module" (2307) marker. React to that — fetch the
+  // declaration graph for exactly the package it couldn't resolve and inject it.
+  monaco.editor.onDidChangeMarkers((resources: readonly Uri[]) => {
+    if (!activeWorkspaceId) return
+    const prefix = `/${activeWorkspaceId}/tools/`
+    for (const resource of resources) {
+      if (!resource.path.startsWith(prefix)) continue
+      const model = monaco.editor.getModel(resource)
+      if (!model) continue
+      const specs: string[] = []
+      for (const mk of monaco.editor.getModelMarkers({ resource })) {
+        const code = typeof mk.code === 'object' && mk.code ? mk.code.value : mk.code
+        if (String(code) !== '2307' && !/cannot find module/i.test(mk.message)) continue
+        const fromRange = model.getValueInRange({
+          startLineNumber: mk.startLineNumber,
+          startColumn: mk.startColumn,
+          endLineNumber: mk.endLineNumber,
+          endColumn: mk.endColumn,
+        })
+        const spec = (SPEC_RE.exec(fromRange) ?? SPEC_RE.exec(mk.message))?.[1]
+        if (!spec || spec.startsWith('.') || spec.startsWith('/') || spec.startsWith('node:')) continue
+        specs.push(spec)
+      }
+      if (specs.length) void ensurePackages(activeWorkspaceId, specs)
+    }
+  })
 }
 
 /**
- * Re-inject the DSL ambient .d.ts after it is regenerated (e.g. when the
- * connected-agents list loads or the default agent changes, which reshapes the
- * discriminated `AgentOptions` config union). Setting an extra lib with the same
- * `filePath` replaces the prior lib and the TS worker re-resolves; completions
- * are pull-based so the suggest widget picks up the new shape on its next query.
- * Red squiggles come from the acorn validator (semantic validation is OFF), so
- * there are no TS-service markers to refresh here.
- *
+ * The always-present libs for tool buffers, namespaced by the ACTIVE workspace:
+ * the real capability source (so `defineCapability` is typed) at the workspace's
+ * cap-lib path, and the (ws-independent) node:* shim.
+ */
+function baseToolLibs(wsId: string): { content: string; filePath: string }[] {
+  return [
+    { content: capabilitySource, filePath: capabilityLibPath(wsId) },
+    { content: NODE_SHIM_DTS, filePath: NODE_SHIM_FILE_PATH },
+  ]
+}
+
+// --- Per-workspace tool-file intellisense manager ---------------------------
+// Bridges each workspace's node_modules to Monaco's single worker. Only the
+// ACTIVE workspace's libs are published; the inactive workspace's tool models are
+// disposed on switch (§2.4). Every lib URI is namespaced by its workspaceId.
+
+const SPEC_RE = /['"]([^'"]+)['"]/
+
+let toolMonaco: Monaco | null = null
+let activeWorkspaceId: string | null = null
+const wsSources = new Map<string, { filePath: string; content: string }[]>()
+const wsOpenPath = new Map<string, string | undefined>()
+const wsPackages = new Map<string, Map<string, string>>() // wsId -> (virtual filePath -> content)
+const wsAttempted = new Map<string, Set<string>>()
+
+function publishToolLibs(): void {
+  if (!toolMonaco || !activeWorkspaceId) return
+  const wsId = activeWorkspaceId
+  const pkgs = wsPackages.get(wsId) ?? new Map<string, string>()
+  const pkg = [...pkgs].map(([filePath, content]) => ({ filePath, content }))
+  const pkgPaths = new Set(pkgs.keys())
+  const openPath = wsOpenPath.get(wsId)
+  // The open file is a live editor MODEL at its URI; adding it as an extra lib too
+  // would double-declare its symbols, so exclude it (and anything a package occupies).
+  const sources = (wsSources.get(wsId) ?? []).filter(
+    (l) => l.filePath !== openPath && !pkgPaths.has(l.filePath),
+  )
+  toolMonaco.languages.typescript.typescriptDefaults.setExtraLibs([...baseToolLibs(wsId), ...sources, ...pkg])
+}
+
+/**
+ * Load a workspace's tool source files into the editor's virtual fs (so sibling
+ * imports resolve), and mark which file is open (excluded — it is a live model).
+ * Republishes only when `wsId` is the active workspace.
+ */
+export async function refreshToolSources(monaco: Monaco, wsId: string, openPath: string | undefined): Promise<void> {
+  toolMonaco = monaco
+  activeWorkspaceId ??= wsId
+  wsOpenPath.set(wsId, openPath)
+  try {
+    wsSources.set(wsId, (await fetchToolSources(wsId)).libs)
+  } catch {
+    /* keep prior sources; the base capability + node:* libs still apply */
+  }
+  if (wsId === activeWorkspaceId) publishToolLibs()
+}
+
+/** Fetch + inject the .d.ts graph for the npm specifiers Monaco couldn't resolve. */
+async function ensurePackages(wsId: string, specifiers: string[]): Promise<void> {
+  const attempted = wsAttempted.get(wsId) ?? new Set<string>()
+  wsAttempted.set(wsId, attempted)
+  const fresh = [...new Set(specifiers)].filter((s) => !attempted.has(s))
+  if (fresh.length === 0) return
+  fresh.forEach((s) => attempted.add(s))
+  try {
+    const pkgs = wsPackages.get(wsId) ?? new Map<string, string>()
+    wsPackages.set(wsId, pkgs)
+    let added = false
+    for (const l of (await fetchToolTypes(wsId, fresh)).libs) {
+      if (!pkgs.has(l.filePath)) {
+        pkgs.set(l.filePath, l.content)
+        added = true
+      }
+    }
+    if (added && wsId === activeWorkspaceId) publishToolLibs()
+  } catch {
+    /* leave it attempted so we don't loop; the marker stays until the next change */
+  }
+}
+
+/**
+ * Make `wsId` the active workspace for the TS service (§2.4): republish ONLY its
+ * libs and dispose the PREVIOUS workspace's tool models so all live models join one
+ * single-project worker for the active workspace. Invoked from the WorkflowEditor's
+ * activeWorkspaceId-subscribed effect, AFTER the store has repointed the buffer
+ * mirror (so the disposed prior-ws models are never the freshly-mirrored buffer).
+ */
+export function setActiveWorkspace(monaco: Monaco, wsId: string): void {
+  const prior = activeWorkspaceId
+  toolMonaco = monaco
+  activeWorkspaceId = wsId
+  monaco.languages.typescript.typescriptDefaults.setExtraLibs([])
+  publishToolLibs()
+  if (prior && prior !== wsId) {
+    const stale = `/${prior}/tools/`
+    for (const m of monaco.editor.getModels()) {
+      if (m.uri.path.startsWith(stale)) m.dispose()
+    }
+  }
+}
+
+/**
+ * Re-inject the DSL ambient .d.ts after it is regenerated (connected-agents list,
+ * default agent, or — now — the ACTIVE workspace's capability/prompt catalogs).
  * Workflows are the ONLY buffers on the JavaScript defaults, so the DSL globals
- * live there alone. The TypeScript defaults belong to tool modules and carry the
- * capability + node:* libs instead — they must NOT be overwritten here, or a tool
- * buffer would lose its `defineCapability` types (and gain phantom workflow
- * globals it shouldn't see).
+ * live there alone; the TypeScript defaults belong to tool modules and carry the
+ * per-workspace capability + node:* libs instead.
  */
 export function updateWorkflowDts(monaco: Monaco, dts: string): void {
   if (dts === lastDts) return

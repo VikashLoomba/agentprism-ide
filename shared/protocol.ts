@@ -14,6 +14,8 @@ export interface RunRequest {
   modeId?: string
   /** Working directory the agents operate in (absolute). */
   cwd: string
+  /** The owning workspace's id (scopes the run to one workspace). */
+  workspaceId: string
   /** Arbitrary JSON exposed to the script as `args`. */
   args?: unknown
   /** Lines (1-based) with breakpoints set. */
@@ -73,29 +75,46 @@ export type InputResponse =
 
 /** Client -> Server WebSocket messages. */
 export type ClientMessage =
-  | { t: 'start'; run: RunRequest }
-  | { t: 'subscribe'; runId: string }
-  | { t: 'resume'; runId: string }
-  | { t: 'step'; runId: string }
-  | { t: 'cancel'; runId: string }
-  | { t: 'setBreakpoints'; runId: string; lines: number[] }
-  | { t: 'permission'; runId: string; requestId: string; response: PermissionResponse }
-  | { t: 'input'; runId: string; requestId: string; response: InputResponse }
+  | { t: 'start'; workspaceId: string; run: RunRequest }
+  | { t: 'subscribe'; workspaceId: string; runId: string }
+  | { t: 'resume'; workspaceId: string; runId: string }
+  | { t: 'step'; workspaceId: string; runId: string }
+  | { t: 'cancel'; workspaceId: string; runId: string }
+  | { t: 'setBreakpoints'; workspaceId: string; runId: string; lines: number[] }
+  | { t: 'permission'; workspaceId: string; runId: string; requestId: string; response: PermissionResponse }
+  | { t: 'input'; workspaceId: string; runId: string; requestId: string; response: InputResponse }
   | { t: 'ping' }
 
 /** Server -> Client WebSocket messages. */
 export type ServerMessage =
-  | { t: 'hello'; agents: AcpAgentSpec[] }
-  | { t: 'snapshot'; snapshot: RunSnapshot }
-  | { t: 'event'; runId: string; event: RunEvent }
-  | { t: 'permission'; runId: string; req: PermissionRequest }
-  | { t: 'permission:resolved'; runId: string; requestId: string }
-  | { t: 'input'; runId: string; req: InputRequest }
-  | { t: 'input:resolved'; runId: string; requestId: string }
-  | { t: 'error'; runId?: string; message: string }
+  | { t: 'hello'; agents: AcpAgentSpec[]; workspaces: WorkspaceInfo[]; defaultWorkspaceId: string }
+  | { t: 'snapshot'; workspaceId: string; snapshot: RunSnapshot }
+  | { t: 'event'; workspaceId: string; runId: string; event: RunEvent }
+  | { t: 'permission'; workspaceId: string; runId: string; req: PermissionRequest }
+  | { t: 'permission:resolved'; workspaceId: string; runId: string; requestId: string }
+  | { t: 'input'; workspaceId: string; runId: string; req: InputRequest }
+  | { t: 'input:resolved'; workspaceId: string; runId: string; requestId: string }
+  | { t: 'error'; workspaceId?: string; runId?: string; message: string }
   | { t: 'pong' }
 
 /* ----------------------------- REST DTOs ----------------------------- */
+
+/** Safe, serializable description of a workspace (ships to the browser). */
+export interface WorkspaceInfo {
+  id: string
+  name: string
+  root: string
+  isDefault: boolean
+}
+
+export interface WorkspacesResponse {
+  workspaces: WorkspaceInfo[]
+  defaultWorkspaceId: string
+}
+
+export interface OpenWorkspaceRequest {
+  root: string
+}
 
 export interface WorkflowFileInfo {
   name: string
@@ -163,4 +182,25 @@ export interface PromptCatalogEntry {
 
 export interface PromptsResponse {
   prompts: PromptCatalogEntry[]   // both tiers, tier-tagged
+}
+
+/** One editor extra-lib: a virtual file the Monaco TS service resolves against. */
+export interface ToolLib {
+  /** Virtual path, e.g. file:///tools/helpers.ts or file:///node_modules/lodash/index.d.ts. */
+  filePath: string
+  content: string
+}
+
+/** Every tool source file — loaded into the editor's virtual fs for sibling resolution. */
+export interface ToolSourcesResponse {
+  libs: ToolLib[]
+}
+
+/** Resolve the .d.ts graph for the npm specifiers Monaco reported unresolved. */
+export interface ToolTypesRequest {
+  specifiers: string[]
+}
+
+export interface ToolTypesResponse {
+  libs: ToolLib[]
 }

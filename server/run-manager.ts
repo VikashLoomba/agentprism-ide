@@ -1,12 +1,15 @@
 import type { WebSocket } from 'ws'
 import type { ClientMessage, ServerMessage } from '../shared/protocol.ts'
 import type { RunSnapshot } from '../shared/events.ts'
-import type { Runtime, RunHandle, RunInteraction } from '../runtime/index.ts'
+import type { RunHandle, RunInteraction } from '../runtime/index.ts'
+import type { WorkspaceRegistry } from '../runtime/index.ts'
 
 /** Keep at most this many finished runs around for late-attach inspection. */
 const MAX_FINISHED = 25
 
 interface RunEntry {
+  /** The owning workspace's id (every broadcast carries it; subscribe validates it). */
+  workspaceId: string
   /** The runtime handle this entry adapts. */
   handle: RunHandle
   /** WebSocket clients receiving this run's broadcasts. */
@@ -23,20 +26,20 @@ function send(ws: WebSocket, msg: ServerMessage): void {
 }
 
 /**
- * The thin WS subscription/broadcast adapter over the runtime controller. It no
- * longer constructs `WorkflowRun`; it drives `runtime.run()`/`runtime.get()` and
- * forwards runtime events/interactions onto the WebSocket protocol — the IDE
- * server is nothing but a consumer of the runtime.
+ * The thin WS subscription/broadcast adapter over the workspace registry. It no
+ * longer constructs `WorkflowRun`; it drives `ws.runtime.run()` for the message's
+ * workspace and forwards runtime events/interactions onto the WebSocket protocol —
+ * the IDE server is nothing but a consumer of the runtime. One socket multiplexes
+ * N workspaces; every outbound message carries its `workspaceId` (§WU-10).
  *
  * The map is keyed by the CLIENT-supplied runId (from the `start` message), which
- * the frontend correlates against. The runtime controller generates its own
- * engine runId, so every outbound `snapshot`/`event`/`permission`/`input` carries
- * the client runId (the snapshot's internal `runId` is rewritten to match).
+ * the frontend correlates against. Each entry additionally records its owning
+ * `workspaceId` so subscribe can validate and every broadcast can tag it.
  */
 export class RunManager {
   private runs = new Map<string, RunEntry>()
 
-  constructor(private runtime: Runtime) {}
+  constructor(private registry: WorkspaceRegistry) {}
 
   private broadcast(clientRunId: string, msg: ServerMessage): void {
     const entry = this.runs.get(clientRunId)
@@ -64,10 +67,16 @@ export class RunManager {
 
   start(message: Extract<ClientMessage, { t: 'start' }>, ws: WebSocket): void {
     const { run: request } = message
+    const workspaceId = message.workspaceId
     const clientRunId = request.runId
+    const workspace = this.registry.get(workspaceId)
+    if (!workspace) {
+      send(ws, { t: 'error', workspaceId, runId: clientRunId, message: 'Unknown workspace.' })
+      return
+    }
     const existing = this.runs.get(clientRunId)
     if (existing && !existing.finishedAt) {
-      send(ws, { t: 'error', runId: clientRunId, message: 'A run with this id is already active.' })
+      send(ws, { t: 'error', workspaceId, runId: clientRunId, message: 'A run with this id is already active.' })
       return
     }
     // Replace a stale finished entry sharing the same client runId.
@@ -80,7 +89,7 @@ export class RunManager {
     // The controller returns the handle synchronously and defers the engine boot
     // to a microtask, so listeners registered here (and the snapshot sent below)
     // are wired up BEFORE the engine starts — no event is missed.
-    const handle = this.runtime.run(
+    const handle = workspace.runtime.run(
       { source: request.source },
       request.args as Record<string, unknown> | undefined,
       {
@@ -102,7 +111,7 @@ export class RunManager {
       // Interactions are delivered via the dedicated permission/input messages,
       // never the {t:'event'} channel (two-transport rule, design §10.D).
       if (event.type === 'interaction:request' || event.type === 'interaction:resolved') return
-      this.broadcast(clientRunId, { t: 'event', runId: clientRunId, event })
+      this.broadcast(clientRunId, { t: 'event', workspaceId, runId: clientRunId, event })
       if (event.type === 'run:finished') {
         const entry = this.runs.get(clientRunId)
         if (entry) {
@@ -113,20 +122,21 @@ export class RunManager {
     })
     const offInteraction = handle.onInteraction((interaction: RunInteraction) => {
       if (interaction.type === 'permission') {
-        this.broadcast(clientRunId, { t: 'permission', runId: clientRunId, req: interaction.req })
+        this.broadcast(clientRunId, { t: 'permission', workspaceId, runId: clientRunId, req: interaction.req })
       } else {
-        this.broadcast(clientRunId, { t: 'input', runId: clientRunId, req: interaction.req })
+        this.broadcast(clientRunId, { t: 'input', workspaceId, runId: clientRunId, req: interaction.req })
       }
     })
     const offResolved = handle.onInteractionResolved(({ requestId, type }) => {
       if (type === 'permission') {
-        this.broadcast(clientRunId, { t: 'permission:resolved', runId: clientRunId, requestId })
+        this.broadcast(clientRunId, { t: 'permission:resolved', workspaceId, runId: clientRunId, requestId })
       } else {
-        this.broadcast(clientRunId, { t: 'input:resolved', runId: clientRunId, requestId })
+        this.broadcast(clientRunId, { t: 'input:resolved', workspaceId, runId: clientRunId, requestId })
       }
     })
 
     this.runs.set(clientRunId, {
+      workspaceId,
       handle,
       subscribers,
       unsubscribe: () => {
@@ -135,23 +145,27 @@ export class RunManager {
         offResolved()
       },
     })
-    send(ws, { t: 'snapshot', snapshot: this.withRunId(handle.snapshot(), clientRunId) })
+    send(ws, { t: 'snapshot', workspaceId, snapshot: this.withRunId(handle.snapshot(), clientRunId) })
   }
 
-  subscribe(clientRunId: string, ws: WebSocket): void {
+  subscribe(workspaceId: string, clientRunId: string, ws: WebSocket): void {
     const entry = this.runs.get(clientRunId)
     if (!entry) {
-      send(ws, { t: 'error', runId: clientRunId, message: 'Run not found.' })
+      send(ws, { t: 'error', workspaceId, runId: clientRunId, message: 'Run not found.' })
+      return
+    }
+    if (entry.workspaceId !== workspaceId) {
+      send(ws, { t: 'error', workspaceId, runId: clientRunId, message: 'Run belongs to a different workspace.' })
       return
     }
     entry.subscribers.add(ws)
-    send(ws, { t: 'snapshot', snapshot: this.withRunId(entry.handle.snapshot(), clientRunId) })
+    send(ws, { t: 'snapshot', workspaceId, snapshot: this.withRunId(entry.handle.snapshot(), clientRunId) })
     // Replay outstanding interactions so a late attacher isn't stuck waiting.
     for (const interaction of entry.handle.pending()) {
       if (interaction.type === 'permission') {
-        send(ws, { t: 'permission', runId: clientRunId, req: interaction.req })
+        send(ws, { t: 'permission', workspaceId, runId: clientRunId, req: interaction.req })
       } else {
-        send(ws, { t: 'input', runId: clientRunId, req: interaction.req })
+        send(ws, { t: 'input', workspaceId, runId: clientRunId, req: interaction.req })
       }
     }
   }
@@ -162,7 +176,7 @@ export class RunManager {
         this.start(message, ws)
         break
       case 'subscribe':
-        this.subscribe(message.runId, ws)
+        this.subscribe(message.workspaceId, message.runId, ws)
         break
       case 'resume':
         this.runs.get(message.runId)?.handle.resume()

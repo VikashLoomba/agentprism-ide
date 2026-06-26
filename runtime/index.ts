@@ -1,85 +1,92 @@
 // runtime/index.ts
 //
-// The published "." surface: a transport-agnostic, embeddable workflow runtime.
-// A host app `import { createRuntime } from 'agentprism'` and runs workflows
-// programmatically, receiving the full event stream and the mid-run interaction
-// round-trips (permission + human-in-the-loop input). The IDE's WS/HTTP server is
-// just another consumer of this exact API — there is ONE engine.
-import { RunController } from './run-controller.ts'
-import type { Prepared, RunHandle, RunOptions, RunResult } from './run-controller.ts'
-import { resolveWorkflow } from './resolve.ts'
+// The published "." surface: a transport-agnostic, embeddable workflow runtime
+// that hosts a WorkspaceRegistry (N workspaces in one process). A host app
+// `import { createRuntime } from 'agentprism'` and runs workflows programmatically,
+// receiving the full event stream and the mid-run interaction round-trips. The
+// IDE's WS/HTTP server is just another consumer of this exact API — ONE engine.
+import { createWorkspaceRegistry } from './workspace-registry.ts'
+import { listAgents } from './agents.ts'
 import type { WorkflowRef } from './resolve.ts'
-import { validateWorkflow } from '../shared/validate.ts'
-import { validateInputs } from '../shared/validate-inputs.ts'
-import { loadCapabilities } from '../server/workflow/capability-loader.ts'
-import { loadPrompts } from '../server/workflow/prompt-loader.ts'
+import type { RunHandle, RunOptions, RunResult } from './run-controller.ts'
+import type { WorkspaceRegistry } from './workspace.ts'
 import type { CapabilityCatalog } from '../shared/capability-resolve.ts'
 import type { PromptCatalog } from '../shared/prompt-resolve.ts'
+import type { AcpAgentSpec } from '../shared/agents.ts'
 
 export interface RuntimeOptions {
-  /** Default working directory for runs (NOT the package root). Defaults to the
-   *  host's AGENTPRISM_DEFAULT_CWD / process.cwd(). A run may override per-call. */
+  /** Pre-open these roots; the FIRST is the default. Back-compat: omit -> a single
+   *  default workspace at `cwd ?? process.cwd()` (today's behavior). */
+  workspaces?: Array<string | { root: string; env?: NodeJS.ProcessEnv }>
+  /** Back-compat: default workspace root when `workspaces` omitted. */
   cwd?: string
-  /** Secret source threaded into capability effects. Defaults to process.env.
-   *  Never serialized to the browser, never persisted. */
+  /** Registry-wide default env. Defaults to process.env; never serialized. */
   env?: NodeJS.ProcessEnv
 }
 
 export interface Runtime {
-  /** Start a workflow. Validates `input` against the workflow's `meta.inputs`
-   *  BEFORE starting; on failure the returned handle settles `failed` with the
-   *  errors and emits a failed run:finished. */
+  /** The workspace registry this runtime hosts (open/close/list workspaces). */
+  readonly workspaces: WorkspaceRegistry
+  /** Back-compat convenience delegating to `workspaces.default()`. */
   run(workflow: WorkflowRef, input?: Record<string, unknown>, options?: RunOptions): RunHandle
-  /** Late-attach to an in-flight or recently-finished run by id. */
+  /** Late-attach to an in-flight or recently-finished run by id (searches all). */
   get(runId: string): RunHandle | undefined
   list(): RunHandle[]
-  /** The resolved capability + prompt catalogs (reused by the IDE server). */
+  /** The default workspace's resolved capability + prompt catalogs. */
   catalogs(): Promise<{ capabilities: CapabilityCatalog; prompts: PromptCatalog }>
+  /** Process-global agent catalog + PACKAGE_ROOT install probe (§4.1). */
+  listAgents(): AcpAgentSpec[]
 }
 
 export function createRuntime(options: RuntimeOptions = {}): Runtime {
   const env = options.env ?? process.env
-  const controller = new RunController({ env, cwd: options.cwd })
+  const registry = createWorkspaceRegistry({ env })
+
+  if (options.workspaces && options.workspaces.length > 0) {
+    for (const w of options.workspaces) {
+      if (typeof w === 'string') registry.open(w)
+      else registry.open(w.root, { env: w.env })
+    }
+  } else {
+    // Back-compat: a single default workspace at cwd ?? process.cwd(). This is the
+    // SOLE permitted process.cwd() reader in the runtime (composition-root default).
+    registry.open(options.cwd ?? process.cwd(), { useEnvDirOverrides: true })
+  }
 
   return {
-    run(workflow, input, runOptions = {}) {
-      const agent = runOptions.agent ?? 'claude'
-      const prepare = async (): Promise<Prepared> => {
-        const source = await resolveWorkflow(workflow)
-        // Best-effort meta extraction to gate inputs before the engine starts.
-        // `meta` is undefined whenever the meta literal has ANY validation error,
-        // so this falls back to "no declared inputs" (free-form args, back-compat);
-        // the engine re-validates fully against the live catalogs at start().
-        const validation = validateWorkflow(source, agent)
-        const result = validateInputs(validation.meta?.inputs, input)
-        if (!result.ok) return { ok: false, errors: result.errors }
-        return { ok: true, source, args: result.value }
+    workspaces: registry,
+    run: (workflow, input, runOptions) => registry.default().runtime.run(workflow, input, runOptions),
+    get(runId) {
+      for (const info of registry.list()) {
+        const handle = registry.getOrThrow(info.id).runtime.get(runId)
+        if (handle) return handle
       }
-      return controller.launch(prepare, runOptions)
+      return undefined
     },
-    get: (runId) => controller.get(runId),
-    list: () => controller.list(),
-    async catalogs() {
-      const [caps, prompts] = await Promise.all([loadCapabilities(env), loadPrompts()])
-      return { capabilities: caps.catalog, prompts: prompts.catalog }
+    list() {
+      return registry.list().flatMap((info) => registry.getOrThrow(info.id).runtime.list())
     },
+    catalogs: () => registry.default().catalogs(),
+    listAgents,
   }
 }
 
 /** Convenience for the common "fire and collect" case: run a workflow to
- *  completion and resolve its terminal result. */
+ *  completion and resolve its terminal result. Opens a one-shot default workspace. */
 export async function runWorkflow(
   workflow: WorkflowRef,
   input?: Record<string, unknown>,
   options: RunOptions & RuntimeOptions = {},
 ): Promise<RunResult> {
-  const { env, ...runOptions } = options
-  const runtime = createRuntime({ cwd: options.cwd, env })
+  const { env, workspaces, cwd, ...runOptions } = options
+  const runtime = createRuntime({ workspaces, cwd: cwd ?? process.cwd(), env })
   return runtime.run(workflow, input, runOptions).done
 }
 
 /* ------------------------------ public types ------------------------------ */
 
+export { computeWorkspaceId } from './workspace.ts'
+export type { Workspace, WorkspaceRegistry, WorkspaceRuntime, WorkspaceInfo } from './workspace.ts'
 export type { WorkflowRef } from './resolve.ts'
 export type { RunHandle, RunOptions, RunResult, RunInteraction } from './run-controller.ts'
 

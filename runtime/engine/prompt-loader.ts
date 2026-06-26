@@ -25,8 +25,10 @@ export interface LoadedPrompts {
   templates: Map<string, PromptTemplate> // keyed by bareName (== name == identifier)
 }
 
-export async function loadPrompts(): Promise<LoadedPrompts> {
-  const scanned = await scanPromptFiles()
+export async function loadPrompts(
+  promptDirs: readonly { dir: string; tier: 'project' | 'user' }[],
+): Promise<LoadedPrompts> {
+  const scanned = await scanPromptFiles(promptDirs)
 
   // One shared env across all templates so partials cross-resolve. Register FULL
   // bodies for every scanned file FIRST, then compile each as a renderable template.

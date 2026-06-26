@@ -30,19 +30,25 @@ function findPackageRoot(start) {
   }
 }
 
-/** Minimal `--flag value` / `--flag=value` parser for the passthrough flags. */
+/** Minimal `--flag value` / `--flag=value` parser for the passthrough flags.
+ *  `--workspace` is repeatable and accumulates into an array (the LSP
+ *  initial-workspace-set model); every other flag is last-wins. */
 function parseArgs(argv) {
   const out = {}
+  const push = (key, value) => {
+    if (key === 'workspace') (out.workspace ??= []).push(value)
+    else out[key] = value
+  }
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i]
     if (!arg.startsWith('--')) continue
     const eq = arg.indexOf('=')
     if (eq !== -1) {
-      out[arg.slice(2, eq)] = arg.slice(eq + 1)
+      push(arg.slice(2, eq), arg.slice(eq + 1))
     } else {
       const next = argv[i + 1]
       if (next !== undefined && !next.startsWith('--')) {
-        out[arg.slice(2)] = next
+        push(arg.slice(2), next)
         i++
       } else {
         out[arg.slice(2)] = true
@@ -55,11 +61,11 @@ function parseArgs(argv) {
 async function main() {
   const flags = parseArgs(process.argv.slice(2))
 
-  // --cwd: run from an arbitrary project directory. Catalog dirs (workflows/,
-  // tools/, prompts/) and DEFAULT_CWD are resolved from process.cwd() at module
-  // load time, so chdir BEFORE importing the runtime/server modules.
-  const cwd = typeof flags.cwd === 'string' ? path.resolve(flags.cwd) : process.cwd()
-  if (cwd !== process.cwd()) process.chdir(cwd)
+  // --cwd picks the DEFAULT workspace root (no chdir — the runtime derives every
+  // path from the explicit root). Repeatable --workspace pre-opens more roots
+  // (the LSP initial-set model); the first opened (the default root) is default.
+  const root = typeof flags.cwd === 'string' ? path.resolve(flags.cwd) : process.cwd()
+  const extraRoots = (Array.isArray(flags.workspace) ? flags.workspace : []).map((w) => path.resolve(w))
 
   const port = Number(flags.port ?? process.env.PORT ?? 8787)
 
@@ -80,7 +86,7 @@ async function main() {
   const { createServer } = await import(pathToFileURL(factoryEntry).href)
   const { createRuntime } = await import(pathToFileURL(runtimeEntry).href)
 
-  const runtime = createRuntime({ cwd })
+  const runtime = createRuntime({ workspaces: [root, ...extraRoots] })
   const server = createServer(runtime)
   server.listen(port)
 }

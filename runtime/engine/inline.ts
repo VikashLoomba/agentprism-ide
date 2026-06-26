@@ -3,7 +3,6 @@ import { readFileSync, realpathSync } from 'node:fs'
 import { parse } from 'acorn'
 import type { Node } from 'acorn'
 import ts from 'typescript'
-import { PROJECT_TOOLS_DIR, USER_TOOLS_DIR } from '../config.ts'
 
 /**
  * Pure-helper inlining transform — the esbuild replacement (design §1/§7/§8 C4).
@@ -41,6 +40,10 @@ export interface InlineOptions {
    * (left untouched) rather than inlined.
    */
   workflowPath?: string
+  /** The workspace's ordered tool dirs [project, user] — the containment set. */
+  toolsDirs: readonly string[]
+  /** The workspace's project tool dir (the unsaved-buffer resolution base). */
+  projectToolsDir: string
 }
 
 export interface InlineResult {
@@ -68,7 +71,6 @@ interface ImportNode extends Node {
   }>
 }
 
-const TOOLS_DIRS = [PROJECT_TOOLS_DIR, USER_TOOLS_DIR]
 /** Candidate extensions when a specifier omits one (mirrors the scan: .ts/.js/.mjs). */
 const RESOLVE_EXTS = ['', '.ts', '.js', '.mjs']
 
@@ -109,8 +111,8 @@ function resolveToFile(spec: string, importerDir: string): string | null {
 }
 
 /** Is `file` contained within one of the tools/ dirs (after realpath)? */
-function isUnderToolsDir(file: string): boolean {
-  for (const dir of TOOLS_DIRS) {
+function isUnderToolsDir(file: string, toolsDirs: readonly string[]): boolean {
+  for (const dir of toolsDirs) {
     let realDir: string
     try {
       realDir = realpathSync(dir)
@@ -184,7 +186,11 @@ function collectExportNames(body: Node[]): string[] {
  * are stripped, leaving runnable JS whose top-level bindings + named exports are
  * captured by the wrapping IIFE. `seen` guards against import cycles.
  */
-function buildHelperBody(file: string, seen: Set<string>): { body: string; exports: string[] } {
+function buildHelperBody(
+  file: string,
+  seen: Set<string>,
+  toolsDirs: readonly string[],
+): { body: string; exports: string[] } {
   if (seen.has(file)) {
     throw new InlineLoadError(`circular pure-helper import detected at ${file}`)
   }
@@ -228,13 +234,13 @@ function buildHelperBody(file: string, seen: Set<string>): { body: string; expor
       )
     }
     const resolved = resolveToFile(spec, dir)
-    if (!resolved || !isUnderToolsDir(resolved)) {
+    if (!resolved || !isUnderToolsDir(resolved, toolsDirs)) {
       throw new InlineLoadError(
         `pure helper "${file}" imports "${spec}" which does not resolve under tools/; ` +
           `pure helpers may import ONLY other pure-helper tools/ files.`,
       )
     }
-    const nested = buildHelperBody(resolved, seen)
+    const nested = buildHelperBody(resolved, seen, toolsDirs)
     nestedBindings.push(toHeaderBinding(nested.exports, nested.body))
   }
 
@@ -306,7 +312,7 @@ function toHeaderBinding(exports: string[], body: string): string {
  * - A tools/ import resolving to a capability or pulling in node/bare specifiers
  *   throws `InlineLoadError`.
  */
-export function inlineHelpers(normalizedSource: string, opts: InlineOptions = {}): InlineResult {
+export function inlineHelpers(normalizedSource: string, opts: InlineOptions): InlineResult {
   let ast: { body: Node[] }
   try {
     ast = parseModule(normalizedSource)
@@ -318,11 +324,11 @@ export function inlineHelpers(normalizedSource: string, opts: InlineOptions = {}
 
   const importerDir = opts.workflowPath
     ? path.dirname(opts.workflowPath)
-    : PROJECT_TOOLS_DIR // resolve "../tools/x" relative to a sibling of tools/
+    : opts.projectToolsDir // resolve "../tools/x" relative to a sibling of tools/
   // When no path is given, treat specifiers as relative to the workflows dir's
-  // sibling so "../tools/x" lands in PROJECT_TOOLS_DIR. We approximate with the
-  // project root (parent of PROJECT_TOOLS_DIR).
-  const baseDir = opts.workflowPath ? importerDir : path.dirname(PROJECT_TOOLS_DIR)
+  // sibling so "../tools/x" lands in the project tools dir. We approximate with the
+  // project root (parent of the project tools dir).
+  const baseDir = opts.workflowPath ? importerDir : path.dirname(opts.projectToolsDir)
 
   const importNodes = ast.body.filter((n) => (n as unknown as Node).type === 'ImportDeclaration') as unknown as ImportNode[]
 
@@ -336,10 +342,10 @@ export function inlineHelpers(normalizedSource: string, opts: InlineOptions = {}
     // else (bare, node:, non-tools relative) is left untouched for the vm.
     if (isBareOrNodeSpecifier(spec)) continue
     const resolved = resolveToFile(spec, baseDir)
-    if (!resolved || !isUnderToolsDir(resolved)) continue
+    if (!resolved || !isUnderToolsDir(resolved, opts.toolsDirs)) continue
 
     // It's a tools/ import — discriminate + inline (throws on capability/node).
-    const helper = buildHelperBody(resolved, seen)
+    const helper = buildHelperBody(resolved, seen, opts.toolsDirs)
     seen.clear()
 
     // Capture the names actually imported by the workflow (alias-aware): we emit
