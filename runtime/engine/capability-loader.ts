@@ -1,4 +1,4 @@
-// server/workflow/capability-loader.ts
+// runtime/engine/capability-loader.ts
 // Host-side (TRUSTED realm) loading of capability modules + catalog build.
 // This is the ONLY place a tools/ capability module is import()ed for real,
 // so it must never run inside the vm sandbox. One bad module must not break
@@ -16,7 +16,7 @@ import type { CapabilityCatalogEntry } from '../../shared/protocol.ts'
 import type { CapabilityCatalog } from '../../shared/capability-resolve.ts'
 import { resolveCapability } from '../../shared/capability-resolve.ts'
 
-/** Shape returned by the filesystem scan (server/store/capabilities.ts, item 9). */
+/** Shape returned by the filesystem scan (runtime/store/capabilities.ts, item 9). */
 interface ScannedCapabilityFile {
   name: string
   path: string

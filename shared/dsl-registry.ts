@@ -5,7 +5,7 @@
  * Each method/value is described once here, and the four consumers DERIVE from
  * this list instead of duplicating it:
  *
- *   • server/workflow/executor.ts  — builds the vm globals (impls in methods/*)
+ *   • runtime/engine/executor.ts   — builds the vm globals (impls in methods/*)
  *   • shared/validate.ts           — agent-producer set + agent()/phase() call
  *                                     sites + meta.config validation
  *   • src/lib/workflow-dts.ts      — the Monaco intellisense .d.ts (joins `dts`)
@@ -24,7 +24,7 @@ export interface DslMethodDescriptor {
   name: string
   /**
    * primitive  — privileged, bound from the WorkflowRun host (touches run state).
-   * combinator — pure, built on host + other globals; impl in server/workflow/methods/<name>.ts.
+   * combinator — pure, built on host + other globals; impl in runtime/engine/methods/<name>.ts.
    * value      — a non-callable global (args, cwd, budget, process).
    */
   kind: DslMethodKind

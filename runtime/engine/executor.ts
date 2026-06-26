@@ -83,7 +83,7 @@ function bindValue(name: string, host: SandboxHost): unknown {
  * registry (shared/dsl-registry.ts):
  *
  *   • primitives  → bound from the host (privileged, touch run state)
- *   • combinators → built from server/workflow/methods/<name>.ts on top of the
+ *   • combinators → built from runtime/engine/methods/<name>.ts on top of the
  *                   host + the already-assembled scope (read lazily at call time)
  *   • values      → bound from the host (args/cwd/budget/process)
  *

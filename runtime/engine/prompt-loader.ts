@@ -1,8 +1,8 @@
-// server/workflow/prompt-loader.ts
+// runtime/engine/prompt-loader.ts
 // Host-side compile of .hbs templates + catalog build. Plain text => NO import(),
 // NO zod default-export check, NO secretStatus. One bad file ≠ broken catalog.
 //
-// Mirrors server/workflow/capability-loader.ts: two-tier scan, per-file loadError
+// Mirrors runtime/engine/capability-loader.ts: two-tier scan, per-file loadError
 // isolation, getPromptTemplates() resolving meta.prompts -> loaded templates.
 // DIFFERS from capabilities: plain text (parsePrompt + Handlebars compile, no
 // import()/zod/mixed-module discrimination, no secret plumbing). Per R1 each body

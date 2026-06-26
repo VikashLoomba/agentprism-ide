@@ -1,5 +1,5 @@
 // tools/mr-prompt.ts  — pure helper: no defineCapability, no world access.
-// Inlined into the sandbox by server/workflow/inline.ts (never host-loaded).
+// Inlined into the sandbox by runtime/engine/inline.ts (never host-loaded).
 export function buildReviewPrompt(input: {
   acceptanceCriteria: string[]
   comments: string[]
