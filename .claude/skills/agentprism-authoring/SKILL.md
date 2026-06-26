@@ -31,7 +31,7 @@ If the request spans several (e.g. "a workflow that calls Jira and assembles a r
 
 ## Conventions shared by all three
 
-- **Two tiers.** Each kind resolves a **project** copy first (`tools/`, `prompts/`, `workflows/` in this repo), then a **user library** (`~/.agentprism/tools/`, `~/.agentprism/prompts/`). A project entry **shadows** a user entry of the same name. Force a tier by qualifying the declared name with `project:`, `user:`, or `@me/` (e.g. `user:jira`).
+- **Two tiers.** Each kind resolves a **project** copy first (`tools/`, `prompts/`, `workflows/` under the active **workspace** root — the directory AgentPrism is pointed at, not the app), then a **user library** (`~/.agentprism/tools/`, `~/.agentprism/prompts/`). A project entry **shadows** a user entry of the same name. Force a tier by qualifying the declared name with `project:`, `user:`, or `@me/` (e.g. `user:jira`). A capability's npm imports resolve from that workspace's `node_modules`.
 - **Identifier names.** A tool's `name`, a prompt's **filename bareName**, and any name you declare in `meta` must be a valid JS identifier (`/^[A-Za-z_$][\w$]*$/`) — e.g. `mrReview`, not `mr-review`. The name becomes the global/member you call.
 - **JSON-serializable boundaries.** Anything crossing the sandbox boundary (capability args + results, `agent({ schema })` results) must be JSON-serializable.
 - **Don't store secrets in files.** Capabilities declare secret **names** only; values come from the host environment at run time.

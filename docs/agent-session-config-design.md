@@ -1,5 +1,7 @@
 # Design: replace `agent()` `tier` with a per-call ACP session-config object
 
+> **Historical design record.** Since this was written, the Workspace refactor relocated the engine code out of `server/` into `runtime/` (`server/workflow/run.ts` → `runtime/engine/run.ts`, `server/acp/connection.ts` → `runtime/acp/connection.ts`). Paths below that read `server/...` are pre-relocation; the current architecture is in [`workspace-architecture-plan.md`](workspace-architecture-plan.md).
+
 > Status: **IMPLEMENTED & SHIPPED** (feasibility-verified against
 > `@agentclientprotocol/sdk@1.0.0`). Produced by the `design_agent_session_config`
 > ultracode workflow (4 research agents → synthesis → adversarial feasibility),

@@ -5,7 +5,7 @@ A `tools/<name>.ts` module is one of two kinds, distinguished purely by what it 
 - **Capability** — `export default defineCapability({ … })`. A *world-touching* effect (HTTP, git, secrets) that runs in the **trusted host realm** and is injected into workflows as a namespace global.
 - **Pure helper** — named exports only, **no** `defineCapability` default. Deterministic compute that is **inlined into the sandbox** and imported by workflows.
 
-Both live in `tools/` (project) or `~/.agentprism/tools/` (user library; project shadows user).
+Both live in `tools/` (the **project tier**, resolved relative to the active **workspace** root — the directory AgentPrism is pointed at) or `~/.agentprism/tools/` (the **user tier**, a cross-workspace shared library; project shadows user). A capability's npm imports resolve from *that workspace's* `node_modules`, and the editor resolves the same types — so editor intellisense matches what the runtime loads at run time.
 
 ---
 

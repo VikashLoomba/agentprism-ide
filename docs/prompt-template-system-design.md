@@ -1,5 +1,7 @@
 # Prompt-template system — implementation design
 
+> **Historical design record.** Since this was written, the Workspace refactor relocated the engine/resolution code out of `server/` into `runtime/` (`server/store/prompts.ts` → `runtime/store/prompts.ts`, `server/workflow/prompt-loader.ts` → `runtime/engine/prompt-loader.ts`, `server/workflow/run.ts` → `runtime/engine/run.ts`), resolved per **workspace**. Paths below that read `server/...` are pre-relocation; the current architecture is in [`workspace-architecture-plan.md`](workspace-architecture-plan.md).
+
 ## 1. Summary
 
 AgentPrism's **prompt-template system** is the *declarative sibling* of the just-shipped **capability system**. Where a capability is the declarative counterpart of a host-bound, secret-aware, recorded *effect* (`tools/jira.ts` → `jira.getTicket(args)`), a **prompt template** is the declarative counterpart of a pure-helper prompt builder like `tools/mr-prompt.ts`'s `buildReviewPrompt()`. A template is a Handlebars `.hbs` file with an our-convention frontmatter block declaring its typed parameters; it is **compiled host-side**, injected into the vm sandbox as a **pure namespace global** `prompts.<name>(data) => string`, and rendered identically in a browser **live-preview** pane.

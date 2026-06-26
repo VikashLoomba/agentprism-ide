@@ -25,25 +25,33 @@ Dynamic workflows are powerful, but normally the *agent* writes the orchestratio
 - **Capabilities** — give workflows *world‑touching* powers without leaving the sandbox: declare `meta.capabilities: ['jira', …]` and call host‑injected namespaces (`await jira.getTicket({ key })`). Each call is a **deterministic, recorded effect** run in a trusted host realm; the workflow only ever sees `(args) => Promise<result>`, and recoverable failures resolve to `null`. **Namespace types are auto‑derived** from the tool's effect signatures, so `jira.getTicket(...)` is fully typed in the editor — no hand‑written `.d.ts`. Capabilities live in project `tools/` and a user `~/.agentprism/tools/` library (project shadows user), declare their **secret names** only (presence shown in the run panel; values never stored), and are editable as `.ts` files right in the IDE.
 - **Prompt templates** — assemble prompts deterministically: author Handlebars `.hbs` templates with a typed **frontmatter param schema**, opened in a "Prompts" sidebar with Monaco highlighting and a **live preview** rendered identically to production. Call them in a workflow as `prompts.<name>(data)` — a pure, typed `string`‑returning helper. Two tiers (`prompts/` + `~/.agentprism/prompts/`), with built‑in safe helpers (`eq`, `join`, `json`, …) and partials for composition.
 - **Local files** — save/load workflows as `.js` files in `workflows/`.
+- **Workspaces (multi-root)** — point AgentPrism at any directory on disk; each **workspace** resolves its own `workflows/`, `tools/`, `prompts/`, *and the npm dependencies your tools import* (from the workspace's own `node_modules`). **Open and switch between multiple workspaces** in one session — each with its own runs, catalogs, and editor intellisense (see [Workspaces](#workspaces)).
 
 ## Architecture
 
 ```
 ┌──────────────────────────────┐         ┌─────────────────────────────────────────┐
-│  Browser (Vite + React 19)   │  WS/REST │  Node backend (Express + ws)            │
-│  • Monaco editor + validation│ <──────> │  • RunManager → WorkflowRun             │
-│  • run tree / ACP log / BPs  │          │  • vm sandbox executor (DSL globals)    │
-│  • zustand store             │          │  • AcpAgentConnection (stdio JSON-RPC)  │
-└──────────────────────────────┘          └───────────────┬─────────────────────────┘
+│  Browser (Vite + React 19)   │  WS/REST │  server/ — thin HTTP/WS adapter          │
+│  • Monaco editor + validation│ <──────> │    workspace-scoped /api/workspaces/:id  │
+│  • run tree / ACP log / BPs  │          │  ───────────────────────────────────────│
+│  • zustand store (per‑ws)    │          │  runtime/ — the engine (Node)            │
+└──────────────────────────────┘          │    • WorkspaceRegistry → Workspace       │
+                                           │    • vm sandbox executor (DSL globals)   │
+                                           │    • AcpAgentConnection (stdio JSON‑RPC) │
+                                           └───────────────┬─────────────────────────┘
                                                            │ spawns
                                           ┌────────────────┴───────────────┐
                                           │ claude-agent-acp / codex-acp    │  (ACP agents)
                                           └─────────────────────────────────┘
 ```
 
-- The browser only authors & validates; it can't spawn processes.
-- The backend runs the workflow in a Node `vm` realm (determinism prelude + async IIFE, mirroring pi‑dynamic‑workflows). The injected `agent()` drives an **ACP session**; `parallel`/`pipeline`/the quality‑pattern stdlib are implemented on top of it.
-- Shared TypeScript types in `shared/` define the DSL, the run‑event model, and the WS/REST protocol used by both ends.
+The codebase is split into cleanly delineated layers:
+
+- **`runtime/`** is the transport-agnostic engine and the **only layer that touches the filesystem**: it owns the `WorkspaceRegistry` + each `Workspace` (catalog resolution, capability loading, tool-type resolution), the Node `vm` sandbox executor (determinism prelude + async IIFE, mirroring pi‑dynamic‑workflows), and the `AcpAgentConnection`s. It's also the importable npm surface (`createRuntime`).
+- **`server/`** is a **thin HTTP/WS adapter** that projects the runtime to the browser — every resource route is workspace-scoped (`/api/workspaces/:workspaceId/*`) and resolves to a `Workspace`; it holds no resolution logic of its own.
+- The **browser** only authors & validates; it can't spawn processes. Its store keeps per-workspace state and Monaco editor URIs are namespaced per workspace.
+- **`shared/`** defines the DSL, the run‑event model, and the WS/REST protocol (incl. `workspaceId`) used by both ends.
+- A workspace's tools import their npm dependencies from **that workspace's** `node_modules`, and the editor resolves the *same* types — so editor intellisense matches what the runtime actually loads. AgentPrism's own install dir is used only to serve its bundled UI and agent binaries, never to resolve your content.
 
 ## Requirements
 
@@ -166,6 +174,15 @@ const ticket = await jira.getTicket({ key: args.jiraKey }) // `args` is typed fr
 - Validation is **strict** (no loose coercion): a required value that is missing, or a value whose type doesn't match, blocks the run with an error. The same `validateInputs` gate runs in the IDE *and* in the programmatic API (see below), so a host gets identical errors.
 - **Back-compat:** a workflow with no `meta.inputs` behaves exactly as before — free-form `args`, `args: any`, no gating.
 
+## Workspaces
+
+A **workspace** is a directory on disk that holds your `workflows/`, `tools/`, and `prompts/` — and whose own `node_modules` provides the npm dependencies your capability tools import. AgentPrism is **workspace-centric** and **multi-root**: the runtime hosts a registry of workspaces, and you can open and switch between several in one session.
+
+- **Single root, conventional subdirs.** Pointing AgentPrism at `/path/to/project` resolves `/path/to/project/{workflows,tools,prompts}` plus that project's `node_modules`. A global `~/.agentprism/{tools,prompts}` library is merged as a second tier (project shadows user).
+- **Everything is scoped per workspace** — runs, catalogs, the open editor buffer/file list, and editor intellisense. Same-named tools in different workspaces don't collide, and a tool's npm types resolve from *its* workspace (e.g. two workspaces pinned to different `zod` versions each see their own).
+- **Switch in the UI** via the workspace picker; each workspace shows an attention badge when a background run needs input. Open another folder at runtime, or pre-open several from the CLI.
+- **The bin** picks a default workspace from `--cwd` (or the current directory) and accepts repeatable `--workspace <dir>` flags to pre-open more. Per-workspace dir overrides via the `AGENTPRISM_*_DIR` env vars apply to the **default** workspace.
+
 ## Embedding / packaging
 
 AgentPrism ships as a single npm package with two entry points: a CLI that boots the IDE, and an importable runtime that runs workflows programmatically.
@@ -173,11 +190,12 @@ AgentPrism ships as a single npm package with two entry points: a CLI that boots
 ### Boot the IDE locally
 
 ```bash
-npx agentprism-ide          # boots the server + serves the bundled IDE
+npx agentprism-ide                         # default workspace = current directory
 npx agentprism-ide --port 9090 --cwd /path/to/project
+npx agentprism-ide --workspace /repo/a --workspace /repo/b   # pre-open multiple workspaces
 ```
 
-This serves the editor and backend from the installed package, while resolving your project's `workflows/`, `tools/`, and `prompts/` (and the run working directory) from the **current directory** — so it works from any project. Agent logins and secrets are read from your environment exactly as in dev.
+This serves the editor and backend from the installed package, while resolving each **workspace's** `workflows/`, `tools/`, and `prompts/` (and that workspace's `node_modules`) from the directory you point it at — so it works from any project, and several at once. Agent logins and secrets are read from your environment exactly as in dev.
 
 ### Run workflows programmatically
 
@@ -186,7 +204,7 @@ Import the runtime to drive workflows from your own program. You get the **full 
 ```js
 import { createRuntime } from 'agentprism'
 
-const runtime = createRuntime() // { cwd?, env? } — env defaults to process.env
+const runtime = createRuntime() // { cwd?, env?, workspaces? } — default workspace = cwd
 
 const handle = runtime.run(
   { name: 'mr_review' },                       // a saved workflow… or { source: '<inline script>' }
@@ -207,7 +225,7 @@ off()
 console.log(result.status, result.result)
 ```
 
-- `createRuntime(options?)` → `{ run, get, list, catalogs }`. `run(workflow, input?, options?)` returns a `RunHandle` synchronously, so you can subscribe before the engine starts.
+- `createRuntime(options?)` → `{ workspaces, run, get, list, catalogs, listAgents }`. `run(workflow, input?, options?)` runs in the **default workspace** and returns a `RunHandle` synchronously, so you can subscribe before the engine starts. Pass `options.workspaces: [root, …]` (a string root or `{ root, env }`) to host **multiple** workspaces, and run in a specific one with `runtime.workspaces.getOrThrow(id).runtime.run(...)`.
 - **Interactions, two ergonomics over one mechanism:** supply `onPermission` / `onInput` resolvers (the engine awaits them directly), **or** omit them and answer out-of-band via `handle.respond(requestId, response)` after the request arrives as an event. A production host typically implements only the semantic interactions (permission, input); the debug controls (`handle.resume()` / `step()` / `setBreakpoints()`) are the IDE's surface.
 - **Input validation up front:** `run()` validates `input` against the workflow's `meta.inputs` **before** starting. On failure the handle settles `failed` with the error list and emits a failed `run:finished` — same surface as any other failure.
 - A `runWorkflow(workflow, input?, options?)` convenience runs to completion and resolves the terminal `RunResult` in one call.
@@ -222,15 +240,18 @@ Point your coding agent at the **[`agentprism-authoring`](.claude/skills/agentpr
 ## Project layout
 
 ```
-shared/      DSL types, run-event model, WS/REST protocol, capability + prompt env, the validator (browser + server)
-server/      Express + ws, ACP connection, vm executor, capability/prompt loaders, run orchestration, file store
-src/         React app: Monaco editor, meta form, file browser, run tree, ACP log, Handlebars preview, store
-workflows/   Saved workflow .js files
-tools/       Capability modules (world-touching effects) + pure helpers, imported host-side
-prompts/     Handlebars (.hbs) prompt templates with typed frontmatter params
+shared/      DSL types, run-event model, WS/REST protocol (incl. workspaceId), capability + prompt env, the validator (browser + server)
+runtime/     The engine + importable npm surface: WorkspaceRegistry + Workspace, vm executor (engine/), ACP connection (acp/),
+             capability/prompt loaders + tool-intellisense, file stores (store/). The ONLY layer that touches the filesystem.
+server/      Thin HTTP/WS adapter (Express + ws): workspace-scoped /api/workspaces/:id routes that project the runtime; serves the built IDE
+bin/         agentprism-ide CLI entry
+src/         React app: Monaco editor, meta form, workspace picker, file browser, run tree, ACP log, Handlebars preview, per-workspace store
+workflows/   Saved workflow .js files            (resolved per workspace)
+tools/       Capability modules + pure helpers   (resolved per workspace; imported host-side)
+prompts/     Handlebars (.hbs) prompt templates  (resolved per workspace)
 ```
 
-A user-level library at `~/.agentprism/tools/` and `~/.agentprism/prompts/` is merged in as a second tier ("Shared tools" / "Shared prompts"); project entries shadow user entries of the same name.
+`workflows/`, `tools/`, and `prompts/` are resolved relative to each open **workspace** root (not the app). A user-level library at `~/.agentprism/tools/` and `~/.agentprism/prompts/` is merged in as a second tier ("Shared tools" / "Shared prompts"); project entries shadow user entries of the same name. The full architecture is documented in [`docs/workspace-architecture-plan.md`](docs/workspace-architecture-plan.md).
 
 ## Notes & limitations
 

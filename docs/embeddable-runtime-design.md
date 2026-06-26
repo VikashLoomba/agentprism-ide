@@ -1,5 +1,7 @@
 # AgentPrism — Embeddable Runtime + Typed Inputs (P1) — Locked Design
 
+> **Historical design record (shipped).** Both P1 features described here shipped (commit `128c08c`), and the later Workspace refactor (`50970ca`) relocated the engine out of `server/` into `runtime/` (`server/workflow` → `runtime/engine`, etc.) and added first-class multi-workspace support. Paths below that read `server/...` are pre-relocation; the current architecture is in [`workspace-architecture-plan.md`](workspace-architecture-plan.md).
+
 Status: **implementation contract**. Every implementer codes against the interfaces in this
 document. If reality contradicts the doc, fix the doc (orchestrator) — do not silently diverge.
 
